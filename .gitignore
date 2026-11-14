@@ -1,0 +1,13 @@
+/target/
+/docs/evidence/
+/docs/validation.md
+/docs/validation-0.2.md
+/docs/validation-stability-2026-10-29.md
+/docs/visual-input-validation.md
+__pycache__/
+*.py[cod]
+*.log
+*.core
+/core
+.env
+.env.*
