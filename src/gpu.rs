@@ -7,17 +7,27 @@
 use crate::{Result, WindowInfo};
 pub use wgpu;
 #[derive(Debug, Clone)]
+/// Cloneable device resources; these can safely outlive their overlay window.
 pub struct GpuContext {
+    /// Device used by this overlay. Destroying it terminates the overlay runtime.
     pub device: wgpu::Device,
+    /// Queue to which encoded drawing commands are submitted.
     pub queue: wgpu::Queue,
+    /// Swapchain texture format to use when building render pipelines.
     pub format: wgpu::TextureFormat,
+    /// Negotiated surface alpha mode; colors must be premultiplied when required.
     pub alpha_mode: wgpu::CompositeAlphaMode,
 }
 
+/// One acquired swapchain image, borrowed only for a display-thread callback.
 pub struct GpuFrame<'a> {
+    /// Device, queue and target format.
     pub context: &'a GpuContext,
+    /// Current render target, initially cleared to transparent.
     pub view: &'a wgpu::TextureView,
+    /// Encoder submitted by the runtime after the callback succeeds.
     pub encoder: &'a mut wgpu::CommandEncoder,
+    /// Geometry of this acquired image.
     pub info: WindowInfo,
 }
 pub(crate) type GpuDraw = Box<dyn for<'a> FnOnce(GpuFrame<'a>) -> Result<()> + Send + 'static>;
@@ -244,44 +254,68 @@ mod surface {
             draw: &mut Option<GpuDraw>,
             info: WindowInfo,
         ) -> Result<()> {
-            let view = texture
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            let mut encoder =
-                self.context
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("liboverlay GPU frame"),
-                    });
-            // Start every acquired image transparent; never expose undefined pixels
-            // from an old swapchain image when a caller paints only part of the HUD.
-            {
-                let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("transparent clear"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
+            // Keep the acquired surface texture outside the unwind boundary.
+            // wgpu deliberately skips discard while panicking; unwinding past
+            // it can leave swapchain semaphores live during surface destruction.
+            let encoded =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let view = texture
+                        .texture
+                        .create_view(&wgpu::TextureViewDescriptor::default());
+                    let mut encoder = self.context.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("liboverlay GPU frame"),
                         },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
+                    );
+                    // Start every acquired image transparent; never expose undefined pixels
+                    // from an old swapchain image when a caller paints only part of the HUD.
+                    {
+                        let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("transparent clear"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                        });
+                    }
+                    let draw = draw.take().ok_or_else(|| {
+                        OverlayError::Gpu("render callback was already consumed".into())
+                    })?;
+                    draw(GpuFrame {
+                        context: &self.context,
+                        view: &view,
+                        encoder: &mut encoder,
+                        info,
+                    })?;
+                    self.check()?;
+                    self.context.queue.submit([encoder.finish()]);
+                    self.check()
+                }))
+                .unwrap_or(Err(OverlayError::RuntimePanic));
+            // wgpu 25 validates the device before releasing an acquired image
+            // in both present and discard. After device loss that validation can
+            // unwind while the surface still retains its native image. Retain a
+            // texture handle so its resource can be released before teardown.
+            let cleanup = texture.texture.clone();
+            if let Err(error) = encoded {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(texture))).is_err()
+                {
+                    cleanup.destroy();
+                }
+                return Err(error);
             }
-            let draw = draw
-                .take()
-                .ok_or_else(|| OverlayError::Gpu("render callback was already consumed".into()))?;
-            draw(GpuFrame {
-                context: &self.context,
-                view: &view,
-                encoder: &mut encoder,
-                info,
-            })?;
-            self.context.queue.submit([encoder.finish()]);
-            texture.present();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| texture.present())).is_err()
+            {
+                cleanup.destroy();
+                return self.check().and(Err(OverlayError::RuntimePanic));
+            }
             self.check()
         }
     }

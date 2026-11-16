@@ -1,28 +1,35 @@
 # liboverlay-rs
 
-Bibliothèque Rust pour créer des overlays Linux transparents, avec passage des
-clics configurable et sélection des capacités au démarrage.
+A Rust library for transparent Linux overlays, with configurable click-through
+and capability negotiation at startup.
 
-Le package Cargo est `liboverlay-rs` ; le nom utilisé dans le code est
-`liboverlay`. La version 0.2 fournit un rendu CPU ARGB prémultiplié, une
-présentation Vulkan optionnelle, X11 Present et l'échelle fractionnaire Wayland. Le profil
-CPU reste activé par défaut ; la feature `gpu` ajoute la présentation directe.
+The Cargo package is `liboverlay-rs`; its crate name in code is `liboverlay`.
+Version 0.2 provides premultiplied ARGB CPU rendering, optional Vulkan
+presentation, X11 Present, and Wayland fractional scaling. CPU rendering remains
+the default; the `gpu` feature adds direct GPU presentation.
+
+The optional `egui` feature adds a graphical interface to the same GPU surface.
+The generic C API and C++17 wrapper let applications define drawings and controls
+entirely in C/C++, with events identified by control ID, backend selection,
+window tracking, and input management handled by the library. See the
+[C/C++ integration guide](docs/CPP.md) for desktop capabilities and limitations.
 
 ## Installation
 
-Le dépôt contient la version de développement 0.2.0. Pour l'utiliser directement
-dans une application :
+This repository contains development version 0.2.0. To use it directly in an
+application:
 
 ```toml
 [dependencies]
 liboverlay-rs = { git = "https://github.com/CyberSnakeH/liboverlay-rs", branch = "main" }
 ```
 
-Le nom du module importé reste `liboverlay`. Pour activer Vulkan, ajouter
-`features = ["gpu"]` à cette dépendance. Rust 1.85 minimum est déclaré ; consulter
-la [couverture de validation](docs/TESTING.md) pour les compilateurs effectivement testés.
+The imported module remains `liboverlay`. To enable Vulkan, add
+`features = ["gpu"]` to this dependency. The declared minimum Rust version is
+1.85; see the [validation coverage](docs/TESTING.md) for the compilers actually
+tested.
 
-Pour lancer les exemples depuis les sources :
+To run the examples from source:
 
 ```sh
 git clone https://github.com/CyberSnakeH/liboverlay-rs.git
@@ -32,10 +39,16 @@ cargo run --example basic_hud -- auto 10
 
 ## Documentation
 
-- [Utilisation et API](docs/USAGE.md)
+- [Usage and API](docs/USAGE.md)
+- [C/C++ interface, egui, and application example](docs/CPP.md)
 - [Architecture](docs/ARCHITECTURE.md)
-- [Tests, résultats et limites de validation](docs/TESTING.md)
-- [Travaux restants](ROADMAP.md)
+- [Tests, results, and validation limits](docs/TESTING.md)
+- [Performance measurements](docs/PERFORMANCE.md)
+- [Hardware validation and optical measurements](docs/HARDWARE_VALIDATION.md)
+- [Development and release preparation](docs/DEVELOPMENT.md)
+- [Keyboard, text, touch, and interactive regions](docs/INPUT_DESIGN.md)
+- [Changelog](CHANGELOG.md)
+- [Remaining work](ROADMAP.md)
 
 ```rust,no_run
 use liboverlay::{premultiply, OverlayBuilder, OverlayError};
@@ -71,165 +84,232 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-## Exemples
+## Examples
 
 ```sh
 cargo run --example basic_hud -- auto 10
 cargo run --example basic_hud -- wayland 10
 cargo run --example basic_hud -- x11 10
 cargo run --example interactive_toggle
+cargo run --example input_events
 cargo run --example diagnose -- auto
 cargo run --features gpu --example gpu_hud -- auto 10
 cargo run --features gpu --example diagnose -- x11 prefer-gpu
+cargo run --example text_hud -- /path/to/font.ttf wayland 10
 ```
 
-`interactive_toggle` alterne toutes les deux secondes entre un rectangle bleu
-traversable et un rectangle orange qui reçoit les clics. Le clavier n'est pas
-demandé. L'exemple s'arrête après douze secondes. Il ne crée aucun raccourci
-global et ne génère aucun clic synthétique.
+`interactive_toggle` alternates every two seconds between a blue rectangle that
+passes clicks through and an orange rectangle that receives them. It does not
+request keyboard input. The example exits after twelve seconds. It creates no
+global shortcut and generates no synthetic clicks.
 
-## Sélection et capacités
+`text_hud` integrates the fontdue CPU text renderer with a font supplied by the
+application. It prepares glyphs at physical scale and rebuilds them when geometry
+changes. The text dependency applies only to examples and is not added to the
+dependencies of applications using the library.
 
-`Auto` examine `WAYLAND_DISPLAY`/`WAYLAND_SOCKET`, tente une vraie connexion
-Wayland, puis tente `DISPLAY` si nécessaire. XWayland et Xorg utilisent le même
-backend X11. Une préférence explicite `WaylandOnly` ou `X11Only` interdit le repli.
+## Backend selection and capabilities
 
-| Fonction | Wayland layer-shell | X11 / XWayland |
+`Auto` examines `WAYLAND_DISPLAY`/`WAYLAND_SOCKET`, attempts a real Wayland
+connection, then tries `DISPLAY` if necessary. XWayland and Xorg use the same X11
+backend. An explicit `WaylandOnly` or `X11Only` preference disables fallback.
+
+| Feature | Wayland layer-shell | X11 / XWayland |
 |---|---|---|
-| Transparence | `wl_shm::ARGB8888` | Visual ARGB RENDER et composition |
-| Passage des clics | Région d'entrée vide + commit | Région SHAPE INPUT vide, version >= 1.1 |
-| Premier plan | Couche layer-shell Overlay | Raise ou demande EWMH, selon le mode |
-| Clavier | Aucun par défaut, OnDemand dès layer-shell v4 | Aucun demandé par défaut, fenêtre gérée pour OnDemand |
-| Cadence CPU | Callback du compositeur | Present synchronisé, sinon timer |
-| Cadence GPU | Swapchain FIFO et callback du compositeur | Swapchain FIFO, si le pilote satisfait les exigences |
-| Échelle | Fractionnaire avec fractional-scale + viewporter, sinon entière | Pixels de l'écran X11 |
-| Écran nommé | Nom `wl_output`, version >= 4 | Moniteurs RandR, version >= 1.5 |
+| Transparency | `wl_shm::ARGB8888` | ARGB RENDER visual and compositing |
+| Click-through | Empty input region + commit | Empty SHAPE INPUT region, version >= 1.1 |
+| Stacking | layer-shell Overlay layer | Raise or EWMH request, depending on mode |
+| Keyboard | XKB and repeat; OnDemand with layer-shell v4+ | XKB and repeat; managed window for OnDemand |
+| Composed text | XCompose and text-input-v3 | XCompose and XIM |
+| Custom regions | Union of logical rectangles | SHAPE INPUT 1.1 |
+| Touch | wl_touch, per seat | XInput 2.2+, per source |
+| CPU frame pacing | Compositor callback | Synchronized Present, otherwise a timer |
+| GPU frame pacing | FIFO swapchain and compositor callback | FIFO swapchain, if the driver meets the requirements |
+| Scaling | Fractional with fractional-scale + viewporter, otherwise integer | X11 screen pixels |
+| Named output | `wl_output` name, version >= 4 | RandR monitors, version >= 1.5 |
 
-La transparence est obligatoire par défaut. `Requirement::Preferred` autorise
-explicitement une fenêtre opaque sur X11 si la composition ou le visual alpha
-manque. `StackingPolicy::RequireOverlayLayer` exige layer-shell ; `PreferOverlay`
-autorise les politiques X11 moins fortes. Le rapport conserve les échecs des
-tentatives précédentes et les limites du backend choisi. Il décrit les capacités
-du protocole, pas une observation des pixels du bureau.
+Transparency is required by default. `Requirement::Preferred` explicitly allows
+an opaque X11 window if compositing or an alpha visual is unavailable.
+`StackingPolicy::RequireOverlayLayer` requires layer-shell; `PreferOverlay`
+allows the weaker X11 policies. The report retains failures from earlier
+attempts and the limitations of the selected backend. It describes protocol
+capabilities, not observed desktop pixels.
 
-La présence d'un serveur XWayland ne garantit pas l'affichage au-dessus d'une
-application Wayland native en plein écran. Les écrans de verrouillage et les
-interfaces du compositeur restent sous le contrôle de ce dernier. Sans layer-shell
-ni repli X11 satisfaisant les exigences, la création retourne `NoBackend`.
+An XWayland server does not guarantee stacking above a native Wayland application
+in fullscreen mode. Lock screens and compositor interfaces remain under the
+compositor's control. Without layer-shell or an X11 fallback that satisfies the
+requirements, creation returns `NoBackend`.
 
-## Rendu, threads et cycle de vie
+## Rendering, threads, and lifecycle
 
-- Les pixels sont des valeurs numériques `0xAARRGGBB`, avec alpha prémultiplié.
-  Utiliser `premultiply(r, g, b, a)` pour convertir des composantes ordinaires.
-  L'ordre des octets du serveur X11 est pris en compte pendant le transfert.
-- Chaque `frame()` commence avec des pixels transparents. `draw()` est un raccourci
-  qui alloue cette frame, appelle la fonction utilisateur puis la présente.
-- Un `OverlayWindow` est un handle clonable `Send + Sync`. Le runtime privé garde
-  les connexions et objets de protocole. Le dernier handle détruit ferme le runtime.
-  `close()` attend le nettoyage des ressources et joint le thread, y compris ses
-  destructeurs natifs. Le dernier handle demande également cet arrêt. L'attente
-  de la boucle est limitée par le délai de commande ; la jointure finale attend
-  aussi la destruction des données locales au thread par les bibliothèques natives.
-- `present()` consomme la frame et signifie « mise en file ». `FrameSubmitted`
-  signifie « envoyée au serveur », sans confirmer l'affichage physique. Une frame
-  remplacée ou devenue obsolète pendant un redimensionnement produit `FrameDiscarded`.
-- La file de commandes contient au plus huit entrées et le runtime conserve au
-  plus une frame en attente. Il peut abandonner des frames pour garder la plus récente.
-  La file d'événements est bornée à 256 entrées ; les mouvements successifs sont
-  fusionnés et les événements les plus anciens peuvent être supprimés.
-- Wayland garde au plus trois buffers SHM, toutes générations confondues, et
-  attend `wl_buffer.release` avant de les réécrire. Une fenêtre masquée peut ne
-  plus recevoir de callbacks de dessin ; les commandes d'entrée restent traitées.
-- X11 négocie Present 1.0 pour les frames CPU, demande une copie au prochain
-  intervalle vertical et attend `CompleteNotify` et `IdleNotify` avant de réécrire
-  le pixmap. Une seule présentation est en vol. Sans Present, le timer utilise
-  `with_frame_interval()` et le rapport indique `FramePacing::Timer`.
-- `set_click_through()` attend l'émission de la requête, indépendamment du rendu.
-  Un délai dépassé ne constitue pas une annulation d'une commande déjà en file.
-- `poll_events()` retourne les erreurs fatales du runtime. Une perte de connexion
-  ferme l'overlay ; aucune migration de backend après affichage n'est implicite.
-- Les dimensions des frames sont physiques. `info()` fournit aussi les dimensions
-  logiques, l'échelle et la génération. Une frame d'un autre overlay est refusée.
-  `WindowInfo.scale_factor` est désormais un `ScaleFactor` exact en 120ᵉ :
-  `as_f64()` fournit la valeur usuelle, `numerator()` la valeur du protocole et
-  `ScaleFactor::ONE` représente 100 %. Ce changement d'API motive la version 0.2.
+- Pixels are numeric `0xAARRGGBB` values with premultiplied alpha. Use
+  `premultiply(r, g, b, a)` to convert ordinary components. The X11 server's byte
+  order is handled during transfer.
+- Each `frame()` starts with transparent pixels. `draw()` obtains that frame,
+  calls the application's function, then presents it. At most two CPU allocations
+  are retained for reuse; their contents are cleared before returning them to the
+  application.
+- An `OverlayWindow` is a cloneable `Send + Sync` handle. The private runtime owns
+  connections and protocol objects. Dropping the last handle closes the runtime.
+  `close()` waits for resource cleanup and joins the thread, including its native
+  destructors. Dropping the last handle also requests this shutdown. Waiting for
+  the event loop is bounded by the command timeout; the final join also waits for
+  native libraries to destroy thread-local data. Shutdown bypasses the drawing
+  queue even when full, and is shared by all clones. Concurrent callers wait for
+  the same cleanup.
+- `present()` consumes the frame and means “queued.” `FrameSubmitted` means “sent
+  to the server,” without confirming physical display. A frame replaced or made
+  obsolete by a resize produces `FrameDiscarded`.
+- The command queue holds at most eight entries, and the runtime retains at most
+  one pending frame. It can discard frames to keep the most recent one. The event
+  queue is bounded to 256 entries; consecutive movements are coalesced. Overflow
+  replaces pending notifications with an observable `InputReset`, followed by the
+  current event; the application must reset the state indicated by its scope and
+  resend its text context.
+- Wayland retains at most three SHM buffers across all generations and waits for
+  `wl_buffer.release` before rewriting them. A hidden window may stop receiving
+  frame callbacks; input commands continue to be processed.
+- X11 negotiates Present 1.0 for CPU frames, requests a copy at the next vertical
+  interval, and waits for `CompleteNotify` and `IdleNotify` before rewriting the
+  pixmap. Only one presentation is in flight. Without Present, the timer uses
+  `with_frame_interval()`, and the report indicates `FramePacing::Timer`. Pixels
+  are transferred using MIT-SHM 1.2 and file descriptors when available; a
+  completion notification permits rewriting them. `PutImage` remains the
+  fallback when shared memory cannot be negotiated.
+- `set_click_through()` waits for the request to be sent, independently of
+  rendering. A timeout does not cancel a command already queued.
+- `poll_events()` returns fatal runtime errors. A lost connection closes the
+  overlay; backend migration after display is not implicit. Clones consume the
+  same event queue: notifications are not broadcast separately to every handle.
+  A fatal error is returned once.
+- Frame dimensions are physical. `info()` also provides logical dimensions, scale,
+  and generation. A frame from another overlay is rejected.
+  `WindowInfo.scale_factor` is now an exact `ScaleFactor` in units of 1/120:
+  `as_f64()` provides the usual multiplier, `numerator()` the protocol value, and
+  `ScaleFactor::ONE` represents 100%. This API change motivates version 0.2.
 
-## GPU direct
+## Presentation and partial updates
 
-Compiler avec `--features gpu`, puis choisir un `RendererPreference` :
+`with_presentation_feedback(true)` requests `FramePresented` notifications in
+addition to `FrameSubmitted`. Wayland negotiates presentation-time; X11 CPU uses
+Present when available. Clocks, sequences, refresh periods, and hardware flags
+remain explicit. Server completion does not measure the monitor's optical
+response. The `presentation_timing` example records these values on a fully
+transparent surface.
 
-- `Cpu` : comportement par défaut, rendu via `frame()` / `draw()` / `present()`.
-- `GpuRequired` : exige une surface Vulkan compatible avec la transparence demandée.
-- `GpuPreferred` : essaie Vulkan dans le backend choisi, puis conserve le rendu
-  CPU si nécessaire ; la raison du repli figure dans `backend_report().warnings`.
+`with_cpu_damage_tracking(true)` compares complete CPU frames to limit uploads
+and damage to changed pixels. This option is disabled by default: it retains an
+additional image, and comparison can cost more than it saves for fullscreen
+animation. Each frame must still contain the complete desired image. The
+[measurements](docs/PERFORMANCE.md) compare counters, moving widgets, and
+fullscreen changes on both backends.
 
-Avec un renderer GPU, `gpu_context()` donne accès au périphérique, à la queue,
-au format et au mode alpha. Préparer les shaders et pipelines avant de dessiner.
-`draw_gpu()` met en file une fonction qui reçoit une vue de texture, un encodeur
-et les dimensions courantes. Cette fonction s'exécute sur le thread d'affichage :
-elle doit rester courte et ne pas appeler les commandes synchrones de la fenêtre.
-Une fonction de dessin obsolète peut être abandonnée avant son exécution.
+## Direct GPU rendering
 
-Les images de la swapchain sont initialisées transparentes, puis les commandes
-sont soumises directement au GPU, sans lecture des pixels vers le CPU. La surface
-et ses textures acquises restent privées au runtime. L'exemple
-[`gpu_hud.rs`](examples/gpu_hud.rs) prépare un pipeline WGSL puis dessine une barre
-animée, avec des marges transparentes. Les couleurs sont prémultipliées dans un
-format UNORM non sRGB. Les adaptateurs logiciels sont refusés par défaut ;
-`with_software_gpu(true)` permet de les autoriser explicitement pour un diagnostic.
+Build with `--features gpu`, then choose a `RendererPreference`:
 
-Le mode FIFO est demandé pour la synchronisation verticale. Ce mode et les
-comptages `FrameSubmitted` ne prouvent pas la cadence physique de l'écran.
-Le GPU n'est retenu que si les modes alpha annoncés satisfont les exigences :
-`PreMultiplied`, ou `Inherit` lorsque l'alpha natif de la fenêtre est établi.
-Un mode opaque exige `Requirement::Preferred` et est signalé comme tel.
+- `Cpu`: the default behavior, rendering through `frame()` / `draw()` / `present()`.
+- `GpuRequired`: requires a Vulkan surface compatible with the requested transparency.
+- `GpuPreferred`: tries Vulkan in the selected backend, then retains CPU rendering
+  if necessary; `backend_report().warnings` records the fallback reason.
 
-Sur la session NVIDIA/XWayland testée, Vulkan n'annonce que `Opaque`. Un overlay
-transparent avec `GpuRequired` est donc refusé ; `GpuPreferred` conserve son alpha
-en utilisant le CPU. La présentation GPU transparente et le facteur 125 % ont été
-validés dans la session Wayland native. Les autres pilotes peuvent annoncer
-d'autres capacités ; aucune liste de bureaux ne remplace cette négociation.
+With a GPU renderer, `gpu_context()` exposes the device, queue, format, and alpha
+mode. Prepare shaders and pipelines before drawing. `draw_gpu()` queues a
+function that receives a texture view, an encoder, and the current dimensions.
+This function runs on the display thread: it must remain short and must not call
+the window's synchronous commands. An obsolete drawing function may be discarded
+before execution. With `panic=unwind`, a panic in a GPU callback becomes
+`RuntimePanic` and closes the runtime after releasing the acquired image. The
+panic hook remains the application's. Device loss is monitored even while idle
+or waiting for a compositor callback.
 
-## Échelle fractionnaire
+An executable built with `panic=abort` retains the process termination behavior
+of that profile; recovery boundaries cannot intercept that termination.
+`downgrade()` provides a `WeakOverlayWindow` for callbacks that need to refer to
+the window. `upgrade()` acquires a handle during execution if the window still
+has an owner. This weak reference lets RAII cleanup work even when a callback is
+waiting for presentation. A strong clone captured in a callback retains ownership
+of the window.
 
-Lorsque `wp_fractional_scale_manager_v1` et `wp_viewporter` sont disponibles,
-le backend utilise l'échelle préférée de la surface, arrondit les dimensions
-physiques au plus proche avec les demis vers le haut, conserve `buffer_scale = 1`
-et fixe la destination du viewport aux dimensions logiques. Un changement
-d'échelle renouvelle la génération des frames et produit `Resized` ; les anciens
-buffers occupés sont conservés jusqu'à leur libération. Sans cette paire de
-protocoles, le backend garde l'échelle entière des sorties.
+Swapchain images are initialized as transparent, then commands are submitted
+directly to the GPU without reading pixels back to the CPU. The surface and its
+acquired textures remain private to the runtime. The
+[`gpu_hud.rs`](examples/gpu_hud.rs) example prepares a WGSL pipeline, then draws an
+animated bar with transparent margins. Colors are premultiplied in a non-sRGB
+UNORM format. Software adapters are rejected by default; `with_software_gpu(true)`
+explicitly permits them for diagnostics.
 
-`KeyboardMode::OnDemand` expose des codes de touches bruts, sans composition de
-texte ni traduction XKB. Sur X11 les codes sont normalisés en soustrayant 8, ce qui
-suppose la convention habituelle evdev ; les configurations XKB personnalisées
-peuvent nécessiter une traduction par l'application. Les axes de défilement,
-le tactile et les raccourcis globaux ne sont pas exposés dans cette version.
+FIFO mode is requested for vertical synchronization. This mode and
+`FrameSubmitted` counts do not prove the screen's physical frame rate. The GPU is
+selected only if advertised alpha modes satisfy the requirements:
+`PreMultiplied`, or `Inherit` when the window's native alpha is established. An
+opaque mode requires `Requirement::Preferred` and is reported as such.
 
-## Dépendances et portabilité
+In the tested NVIDIA/XWayland session, Vulkan advertises only `Opaque`. A
+transparent overlay with `GpuRequired` is therefore rejected; `GpuPreferred`
+preserves alpha by using the CPU. Transparent GPU presentation and 125% scaling
+were validated in the native Wayland session. Other drivers may advertise other
+capabilities; no desktop list replaces this negotiation.
 
-Sans la feature `gpu`, le socle X11 utilise `x11rb::RustConnection` et Wayland le
-backend Rust de `wayland-client`. Il ne nécessite ni en-têtes X11 ni liaison à `libX11`,
-`libxcb` ou `libwayland-client`. L'unification des features Cargo par une application
-peut toutefois activer le backend système de Wayland : vérifier son propre graphe.
+## Fractional scaling
 
-La feature `gpu` utilise le chargeur Vulkan et un pilote ICD. Elle charge
-`libwayland-client.so.0` pour Wayland, ou une connexion `libxcb.so.1` supplémentaire
-pour la surface Vulkan X11. Ces bibliothèques sont chargées dynamiquement, sans
-compilation C manuelle. Dans un binaire compilé avec `gpu`, l'unification des
-features active aussi le backend Wayland système pour le mode CPU de ce binaire.
-Le profil sans `gpu` conserve le transport Rust et la cible musl statique.
+When `wp_fractional_scale_manager_v1` and `wp_viewporter` are available, the backend
+uses the surface's preferred scale, rounds physical dimensions to the nearest
+integer with halves rounded up, retains `buffer_scale = 1`, and sets the viewport
+destination to logical dimensions. A scale change advances the frame generation
+and produces `Resized`; old busy buffers are retained until released. Without
+this pair of protocols, the backend retains integer output scaling.
 
-Le profil GPU partage une instance Vulkan initialisée une fois par processus.
-Les surfaces et périphériques restent propres à chaque fenêtre. Ce cache évite
-de répéter la découverte des pilotes et l'accumulation de ressources constatée
-sur le pilote NVIDIA testé. Le cache conserve des ressources natives jusqu'à
-la fin du processus ; fermer une fenêtre ne réinitialise pas tout le chargeur GPU.
+## Keyboard, text, and touch
 
-Les features `wayland` et `x11` sont activées par défaut et peuvent être choisies
-séparément, y compris avec `gpu`. Les connexions X11 utilisent uniquement les
-sockets Unix locaux. Le transfert SHM pour le rendu CPU X11 et le repositionnement X11
-au branchement d'un écran restent des évolutions à implémenter.
+`KeyboardMode::OnDemand` enables raw keys and their XKB translation, including
+keysyms, modifiers, layout, and repeat. For a text field,
+`with_text_input(TextInputState::enabled())` also enables local XCompose
+composition and integration with the desktop's input protocol. The application
+inserts only `TextCommitted` and displays `TextPreedit` separately from the
+document. Wayland supports surrounding context through text-input-v3; X11 uses
+XIM without surrounding context. XCompose locale tables must be installed for
+the local composition fallback.
+
+`InputRegion` restricts clicks and new touch contacts to a union of rectangles.
+`set_click_through(true)` hides that region; `false` restores it. `Touch` contacts
+distinguish sources and phases, including cancellations. Available capabilities
+and interruptions are explicit. The `input_events` example displays these
+notifications on its own surface. The [input contracts](docs/INPUT_DESIGN.md)
+describe coordinates, limits, and reset handling.
+
+`PointerAxis` provides scroll axes: logical pixels on Wayland and wheel steps on
+X11, with positive values pointing down or right.
+
+## Dependencies and portability
+
+Without the `gpu` feature, X11 uses `x11rb::RustConnection` and Wayland uses the
+Rust backend of `wayland-client`. It requires neither X11 headers nor linking to
+`libX11`, `libxcb`, `libxkbcommon`, or `libwayland-client`. XKB translation,
+Compose, and XIM use Rust libraries; locale data remains external. An application's
+Cargo feature unification can still enable Wayland's system backend: check your
+own dependency graph.
+
+The `gpu` feature uses the Vulkan loader and an ICD driver. It loads
+`libwayland-client.so.0` for Wayland, or an additional `libxcb.so.1` connection for
+the X11 Vulkan surface. These libraries are loaded dynamically without manual C
+compilation. In a binary built with `gpu`, feature unification also enables the
+Wayland system backend for that binary's CPU mode. The profile without `gpu`
+retains Rust transport and the static musl target.
+
+The GPU profile shares one Vulkan instance initialized once per process. Surfaces
+and devices remain specific to each window. This cache avoids repeated driver
+discovery and the resource accumulation observed with the tested NVIDIA driver.
+The cache retains native resources until process exit; closing a window does not
+reset the entire GPU loader.
+
+The `wayland` and `x11` features are enabled by default and can be selected
+separately, including with `gpu`. X11 connections use local Unix sockets only.
+X11 tracks RandR changes and monitor changes, including those that do not resize
+the root window. It recalculates anchoring and, for `Fill`, dimensions. Removing
+a named output closes the overlay on both backends. X11 automatic selection
+follows the primary monitor or the first available one; Wayland retains the
+compositor's policy.
 
 ```sh
 cargo test
@@ -238,7 +318,7 @@ cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo check --no-default-features --features x11
 cargo check --no-default-features --features wayland
-cargo test --test x11_protocol -- --ignored --nocapture
+cargo test --test x11_protocol alpha_input_region_focus_and_cleanup -- --ignored --nocapture --exact
 cargo test --features gpu --test gpu_runtime -- --ignored --nocapture
 cargo run --features gpu --example gpu_stability -- cycles 100 /tmp/liboverlay-cycles.tsv
 cargo run --features gpu --example gpu_stability -- soak 300 /tmp/liboverlay-soak.tsv
@@ -246,27 +326,30 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl --examples
 ```
 
-Le profil CPU vise les binaires musl statiques. La voie GPU requiert le chargeur
-dynamique et les bibliothèques graphiques mentionnées ci-dessus ; les essais GPU
-ont été effectués avec la cible GNU. Aucun profil ne rend disponibles des
-protocoles absents du compositeur.
+The CPU profile targets static musl binaries. The GPU path requires the dynamic
+loader and graphics libraries listed above; GPU tests used the GNU target.
+Neither profile provides protocols absent from the compositor.
 
-Le test `x11_protocol` est volontairement ignoré par défaut : il ouvre sa propre
-petite fenêtre, relit ses pixels et sa région d'entrée côté serveur, contrôle le
-focus et vérifie sa destruction. Il requiert un affichage X11 local avec composition.
-Il ne déplace pas la souris et n'injecte pas d'événement d'entrée.
+The `x11_protocol` tests are ignored by default. The
+`alpha_input_region_focus_and_cleanup` scenario opens its own small window, reads
+its pixels and input region back from the server, checks focus, and verifies
+its destruction; it requires a local composited X11 display and injects no input
+events. The `scripts/check_x11.py --composited --wm` runner adds alpha blending and
+click-to-focus checks on private displays. See [TESTING.md](docs/TESTING.md) for
+their scope.
 
-Les essais sur la session de référence couvrent notamment 100 créations/fermetures
-GPU, cinq minutes de rendu continu et le routage de clics réels entre une fenêtre
-de fond et un overlay Wayland. Les résultats et leurs limites sont décrits dans
-[la documentation de validation](docs/TESTING.md). Les vérifications encore à
-effectuer et les évolutions prévues figurent dans la [feuille de route](ROADMAP.md).
+Validation includes isolated Xvfb and Sway suites, Rust 1.85, one thousand Vulkan
+cycles, two hours of 1920×1080 rendering, and musl binaries executed on Alpine and
+Debian. Earlier visual tests also cover real click routing. Results, completed
+durations, and limitations are described in the
+[validation documentation](docs/TESTING.md). Remaining checks and planned changes
+are listed in the [roadmap](ROADMAP.md).
 
-## Références
+## References
 
-- [Wayland : surfaces, SHM, régions d'entrée et callbacks](https://wayland.freedesktop.org/docs/html/apa.html)
-- [Protocole layer-shell](https://github.com/swaywm/sway/blob/master/protocols/wlr-layer-shell-unstable-v1.xml)
-- [Architecture XWayland](https://wayland.freedesktop.org/docs/book/Xwayland.html)
+- [Wayland: surfaces, SHM, input regions, and callbacks](https://wayland.freedesktop.org/docs/html/apa.html)
+- [layer-shell protocol](https://github.com/swaywm/sway/blob/master/protocols/wlr-layer-shell-unstable-v1.xml)
+- [XWayland architecture](https://wayland.freedesktop.org/docs/book/Xwayland.html)
 - [SHAPE 1.1](https://www.x.org/releases/X11R7.5/doc/Xext/shape.pdf)
 - [EWMH](https://specifications.freedesktop.org/wm/latest-single/)
-- [Protocole fractional-scale](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/fractional-scale/fractional-scale-v1.xml)
+- [fractional-scale protocol](https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/fractional-scale/fractional-scale-v1.xml)

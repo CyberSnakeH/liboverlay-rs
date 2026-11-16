@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, '1.85.0']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev pkg-config cmake g++
+      - name: Install Rust
+        run: rustup toolchain install '${{ matrix.toolchain }}' --profile minimal --component rustfmt,clippy
+      - name: Validate
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+        run: sh scripts/check.sh
+      - name: Build and test C and C++ integration
+        env:
+          RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+        run: |
+          cmake -S examples/cpp -B target/cpp -DCMAKE_BUILD_TYPE=Release
+          cmake --build target/cpp -j 2
+          ctest --test-dir target/cpp --output-on-failure
+
+  features:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ['', x11, wayland, gpu, 'gpu,x11', 'gpu,wayland', 'x11,wayland', 'gpu,x11,wayland', egui, 'egui,x11', 'egui,wayland']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev pkg-config
+      - run: rustup toolchain install stable --profile minimal
+      - name: Test feature combination
+        run: cargo +stable test --locked --no-default-features --features '${{ matrix.features }}'
+
+  x11:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y xvfb picom openbox x11-xkb-utils
+      - run: rustup toolchain install stable --profile minimal
+      - name: Test isolated X11 servers
+        run: python3 scripts/check_x11.py --composited --wm
+
+  musl:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
+      - name: Build static CPU examples
+        run: cargo +stable build --locked --release --target x86_64-unknown-linux-musl --examples
+
+  wayland:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install headless compositor and software Vulkan
+        run: sudo apt-get update && sudo apt-get install -y sway libwayland-dev pkg-config mesa-vulkan-drivers cmake g++ grim xvfb picom libxtst6
+      - run: rustup toolchain install stable --profile minimal
+      - name: Test isolated Wayland sessions and Vulkan policies
+        run: python3 scripts/check_wayland.py --gpu
+      - name: Test egui and C++ on isolated displays
+        env:
+          LIBOVERLAY_TEST_COMPOSITOR: pixman
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+        run: |
+          cmake -S examples/cpp -B target/cpp -DCMAKE_BUILD_TYPE=Release
+          cmake --build target/cpp -j 2
+          python3 scripts/check_cpp.py --x11
+          python3 scripts/check_canvas.py
+
+
+  desktop-input:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install desktop protocol fixtures
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb x11-xkb-utils sway ibus ibus-anthy fcitx5 fcitx5-hangul dbus-x11 libglib2.0-bin python3-gi gir1.2-gtk-4.0
+      - run: rustup toolchain install stable --profile minimal
+      - name: Test actual desktop input methods
+        run: |
+          python3 scripts/check_desktop_ime.py --framework ibus
+          python3 scripts/check_desktop_ime.py --framework fcitx5
+          python3 scripts/check_desktop_ime.py --framework fcitx5 --server-preedit
+          python3 scripts/check_desktop_ime.py --framework fcitx5 --backend wayland
+      - name: Test fullscreen transitions
+        run: python3 scripts/check_fullscreen.py

@@ -11,3 +11,8 @@ __pycache__/
 /core
 .env
 .env.*
+/benchmark.tsv
+/gpu-stability.tsv
+
+/presentation.tsv
+/input-latency.tsv

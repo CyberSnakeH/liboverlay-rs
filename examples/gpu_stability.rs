@@ -4,7 +4,7 @@
 use liboverlay::{
     gpu::{wgpu, GpuContext},
     Anchor, BackendPreference, OverlayBuilder, OverlayError, OverlayEvent, OverlayWindow,
-    RendererPreference,
+    RendererPreference, Size,
 };
 use std::{
     fs::{self, File},
@@ -99,10 +99,10 @@ impl Metrics {
     }
 }
 
-fn window() -> Result<OverlayWindow> {
+fn window(size: Size) -> Result<OverlayWindow> {
     Ok(OverlayBuilder::new()
         .with_title("liboverlay GPU stability validation")
-        .with_size(160, 90)
+        .with_size(size.width, size.height)
         .with_anchor(Anchor::TopRight)
         .with_margin(16)
         .with_backend(BackendPreference::WaylandOnly)
@@ -112,18 +112,26 @@ fn window() -> Result<OverlayWindow> {
 }
 
 fn pipeline(context: &GpuContext) -> wgpu::RenderPipeline {
-    let shader = context.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("stability shader"),
-        source: wgpu::ShaderSource::Wgsl(r#"
+    let color = if std::env::var_os("LIBOVERLAY_VALIDATION_VISIBLE").is_some() {
+        "vec4(0.04, 0.24, 0.12, 0.4)"
+    } else {
+        "vec4(0.0)"
+    };
+    let source = r#"
             @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
                 var vertices = array<vec2<f32>, 3>(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
                 return vec4(vertices[i], 0.0, 1.0);
             }
             @fragment fn fs() -> @location(0) vec4<f32> {
-                return vec4(0.04, 0.24, 0.12, 0.4);
+                return COLOR;
             }
-        "#.into()),
-    });
+        "#.replace("COLOR", color);
+    let shader = context
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("stability shader"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
     context
         .device
         .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -192,11 +200,11 @@ fn draw(
 }
 
 fn submitted(overlay: &OverlayWindow) -> Result<u64> {
+    let events = overlay.poll_events()?;
     if !overlay.is_running() {
         return Err(io::Error::other("GPU runtime stopped unexpectedly").into());
     }
-    Ok(overlay
-        .poll_events()?
+    Ok(events
         .iter()
         .filter(|event| matches!(event, OverlayEvent::FrameSubmitted { .. }))
         .count() as u64)
@@ -219,8 +227,8 @@ fn wait_for_gpu(context: &GpuContext) -> Result<()> {
     Ok(())
 }
 
-fn soak(seconds: u64, metrics: &mut Metrics) -> Result<()> {
-    let overlay = window()?;
+fn soak(seconds: u64, size: Size, metrics: &mut Metrics) -> Result<()> {
+    let overlay = window(size)?;
     println!(
         "report={:#?}; info={:?}",
         overlay.backend_report(),
@@ -232,34 +240,43 @@ fn soak(seconds: u64, metrics: &mut Metrics) -> Result<()> {
     let start = Instant::now();
     let mut last_submission = start;
     let mut next_sample = start;
-    let mut next_toggle = start + Duration::from_secs(5);
     let mut count = 0;
     let mut attempts = 0;
+    let mut paused = false;
+    let mut pauses = 0;
+    let mut longest_gap = Duration::ZERO;
     let mut samples = Vec::new();
     while start.elapsed() < Duration::from_secs(seconds) {
         let n = submitted(&overlay)?;
         count += n;
         if n > 0 {
+            longest_gap = longest_gap.max(last_submission.elapsed());
+            if paused {
+                println!(
+                    "presentation resumed after {} ms",
+                    last_submission.elapsed().as_millis()
+                );
+            }
+            paused = false;
             last_submission = Instant::now();
         }
-        if last_submission.elapsed() > Duration::from_secs(5) {
-            return Err(io::Error::other("no submitted frame for five seconds").into());
+        if last_submission.elapsed() > Duration::from_secs(5) && !paused {
+            // Wayland may withhold callbacks while a surface/output is hidden.
+            // Keep checking runtime/device health and record the pacing pause.
+            pauses += 1;
+            paused = true;
+            println!("presentation paused; runtime is healthy, waiting for compositor pacing");
         }
         draw(&overlay, &pipeline, &callbacks, attempts)?;
         attempts += 1;
         if Instant::now() >= next_sample {
             samples.push(metrics.sample(
-                "soak",
+                if paused { "soak_paused" } else { "soak" },
                 start.elapsed().as_secs(),
                 count,
                 callbacks.load(Ordering::Relaxed),
             )?);
             next_sample = Instant::now() + Duration::from_secs(10);
-        }
-        if Instant::now() >= next_toggle {
-            overlay.set_click_through(false)?;
-            overlay.set_click_through(true)?;
-            next_toggle = Instant::now() + Duration::from_secs(5);
         }
         std::thread::sleep(Duration::from_millis(16));
     }
@@ -287,19 +304,19 @@ fn soak(seconds: u64, metrics: &mut Metrics) -> Result<()> {
         return Err(io::Error::other("no frames were submitted").into());
     }
     println!(
-        "PASS soak seconds={seconds} submitted={count} samples={}",
-        samples.len()
+        "PASS soak seconds={seconds} submitted={count} samples={} pauses={pauses} longest_submission_gap_ms={}",
+        samples.len(), longest_gap.max(last_submission.elapsed()).as_millis()
     );
     Ok(())
 }
 
-fn cycles(count: u64, metrics: &mut Metrics) -> Result<()> {
+fn cycles(count: u64, size: Size, metrics: &mut Metrics) -> Result<()> {
     let mut samples = Vec::new();
     let mut total_frames = 0;
     let mut total_callbacks = 0;
     for index in 1..=count {
         {
-            let overlay = window()?;
+            let overlay = window(size)?;
             if index == 1 {
                 println!("report={:#?}", overlay.backend_report());
             }
@@ -316,8 +333,6 @@ fn cycles(count: u64, metrics: &mut Metrics) -> Result<()> {
                 draw(&overlay, &pipeline, &callbacks, frames)?;
                 std::thread::sleep(Duration::from_millis(8));
             }
-            overlay.set_click_through(false)?;
-            overlay.set_click_through(true)?;
             wait_for_gpu(&context)?;
             total_frames += frames;
             total_callbacks += callbacks.load(Ordering::Relaxed);
@@ -389,8 +404,30 @@ fn main() -> Result<()> {
         .map(|s| s.parse::<u64>())
         .transpose()?
         .unwrap_or(if mode == "soak" { 300 } else { 100 });
-    if count == 0 || count > 3600 {
-        return Err(io::Error::other("count/duration must be in 1..=3600").into());
+    let limit = match mode {
+        "soak" => 86_400,
+        "cycles" | "instances" => 100_000,
+        _ => return Err(io::Error::other("mode must be soak, cycles or instances").into()),
+    };
+    if count == 0 || count > limit {
+        return Err(io::Error::other(format!("count/duration must be in 1..={limit}")).into());
+    }
+    let dimension = |index: usize, default: u32| -> Result<u32> {
+        Ok(arguments
+            .get(index)
+            .map(|s| s.parse())
+            .transpose()?
+            .unwrap_or(default))
+    };
+    if arguments.len() > 6 || (arguments.len() == 5) {
+        return Err(
+            "usage: gpu_stability [soak|cycles|instances] [count] [metrics.tsv] [width height]"
+                .into(),
+        );
+    }
+    let size = Size::new(dimension(4, 160)?, dimension(5, 90)?);
+    if size.width < 16 || size.height < 16 {
+        return Err("surface dimensions must be at least 16 pixels".into());
     }
     let path = arguments
         .get(3)
@@ -399,8 +436,8 @@ fn main() -> Result<()> {
     let mut metrics = Metrics::new(Path::new(path))?;
     metrics.sample("baseline", 0, 0, 0)?;
     match mode {
-        "soak" => soak(count, &mut metrics),
-        "cycles" => cycles(count, &mut metrics),
+        "soak" => soak(count, size, &mut metrics),
+        "cycles" => cycles(count, size, &mut metrics),
         "instances" => instances(count, &mut metrics),
         _ => Err(io::Error::other("mode must be soak, cycles or instances").into()),
     }

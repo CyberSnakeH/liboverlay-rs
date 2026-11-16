@@ -1,0 +1,25 @@
+xkb_keymap {
+    xkb_keycodes "fixture" {
+        minimum = 8; maximum = 255;
+        <AD01> = 24; <AD03> = 26; <AC01> = 38; <AC11> = 48;
+        <LFSH> = 50; <LCTL> = 37; <SPCE> = 65;
+    };
+    xkb_types "fixture" {
+        type "ONE_LEVEL" { modifiers = None; map[None] = Level1; };
+        type "TWO_LEVEL" { modifiers = Shift; map[None] = Level1; map[Shift] = Level2; };
+    };
+    xkb_compatibility "fixture" {};
+    xkb_symbols "fixture" {
+        key <AD01> { type = "TWO_LEVEL", repeat = Yes,
+            symbols[Group1] = [q, Q], symbols[Group2] = [a, A] };
+        key <AD03> { type = "TWO_LEVEL", repeat = Yes, [e, E] };
+        key <AC01> { type = "TWO_LEVEL", repeat = Yes,
+            symbols[Group1] = [a, A], symbols[Group2] = [q, Q] };
+        key <AC11> { type = "ONE_LEVEL", [dead_acute] };
+        key <LFSH> { type = "ONE_LEVEL", [Shift_L] };
+        key <LCTL> { type = "ONE_LEVEL", [Control_L] };
+        key <SPCE> { type = "ONE_LEVEL", [U4E2D] };
+        modifier_map Shift { <LFSH> };
+        modifier_map Control { <LCTL> };
+    };
+};

@@ -5,6 +5,7 @@ Run `cargo build --example diagnose`, then `python3 scripts/check_failure_paths.
 Only the Python standard library is needed. A private temporary Unix socket is
 used to simulate an unresponsive Wayland server; no system settings are changed.
 """
+
 import os
 from pathlib import Path
 import socket
@@ -14,15 +15,27 @@ import tempfile
 import threading
 import time
 
-PROGRAM = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[1] / "target/debug/examples/diagnose"
+PROGRAM = (
+    Path(sys.argv[1])
+    if len(sys.argv) > 1
+    else Path(__file__).resolve().parents[1] / "target/debug/examples/diagnose"
+)
 
 
 def check_case(name, environment, arguments, expected):
     started = time.monotonic()
-    result = subprocess.run([str(PROGRAM), *arguments], env=environment,
-                            capture_output=True, text=True, timeout=7)
+    result = subprocess.run(
+        [str(PROGRAM), *arguments],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=7,
+    )
     output = result.stdout + result.stderr
-    assert result.returncode == 1 and any(word in output for word in expected), (name, output)
+    assert result.returncode == 1 and any(word in output for word in expected), (
+        name,
+        output,
+    )
     assert "panicked" not in output, (name, output)
     print(f"{name}: typed failure, exit=1, elapsed={time.monotonic() - started:.3f}s")
 
@@ -51,8 +64,12 @@ def main():
             worker = threading.Thread(target=hold_connection, daemon=True)
             worker.start()
             try:
-                check_case("unresponsive Wayland peer", {**environment, "WAYLAND_DISPLAY": str(path)},
-                           ["wayland"], ("Timeout", "timed out"))
+                check_case(
+                    "unresponsive Wayland peer",
+                    {**environment, "WAYLAND_DISPLAY": str(path)},
+                    ["wayland"],
+                    ("Timeout", "timed out"),
+                )
             finally:
                 stop.set()
                 worker.join(timeout=1)

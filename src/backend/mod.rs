@@ -18,11 +18,31 @@ pub(crate) trait OverlayBackend {
     fn dispatch(&mut self) -> Result<Vec<OverlayEvent>>;
     fn present(&mut self, frame: &Frame) -> Result<bool>;
     fn set_click_through(&mut self, enabled: bool) -> Result<()>;
+    fn set_input_region(&mut self, _: crate::InputRegion) -> Result<()> {
+        Err(OverlayError::Unsupported("custom input regions"))
+    }
+    fn set_keyboard_capture(&mut self, _: bool) -> Result<()> {
+        Err(OverlayError::Unsupported(
+            "exclusive Wayland keyboard focus",
+        ))
+    }
+    fn reset_input(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn set_text_input(&mut self, _: crate::TextInputState) -> Result<()> {
+        Err(OverlayError::Unsupported("text input"))
+    }
     fn flush(&mut self) -> Result<()>;
     fn wants_write(&self) -> bool {
         false
     }
+    fn needs_dispatch(&self) -> bool {
+        false
+    }
     fn frame_wait(&self) -> Option<Duration> {
+        None
+    }
+    fn idle_wait(&self) -> Option<Duration> {
         None
     }
     #[cfg(feature = "gpu")]

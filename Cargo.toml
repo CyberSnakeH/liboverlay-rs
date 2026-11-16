@@ -7,34 +7,81 @@ description = "Capability-aware Linux overlays with CPU or optional Vulkan prese
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/CyberSnakeH/liboverlay-rs"
-include = ["Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "ROADMAP.md", "src/**", "examples/**", "tests/**", "scripts/*.py", "docs/ARCHITECTURE.md", "docs/USAGE.md", "docs/TESTING.md"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "README.md",
+    "ROADMAP.md",
+    "CHANGELOG.md",
+    "src/**",
+    "examples/*.rs",
+    "tests/**",
+    "scripts/*.py",
+    "scripts/*.sh",
+    "docs/*.md",
+    ".github/workflows/*.yml",
+]
 keywords = ["overlay", "wayland", "x11", "hud", "linux"]
 categories = ["gui", "graphics"]
 
 [lib]
 name = "liboverlay"
 
+[workspace]
+members = ["ffi"]
+default-members = ["."]
+resolver = "2"
+
 [features]
 default = ["wayland", "x11"]
-wayland = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-wlr", "dep:memmap2"]
-x11 = ["dep:x11rb"]
-gpu = ["dep:wgpu", "dep:raw-window-handle", "dep:libloading", "wayland-client?/system", "wayland-client?/dlopen"]
+egui = ["gpu", "dep:egui", "dep:egui-wgpu"]
+wayland = [
+    "dep:wayland-client",
+    "dep:wayland-protocols",
+    "dep:wayland-protocols-wlr",
+    "dep:memmap2",
+    "dep:kbvm",
+]
+x11 = ["dep:x11rb", "dep:memmap2", "dep:kbvm", "kbvm/x11", "dep:xim", "dep:xim-ctext", "dep:encoding_rs"]
+gpu = [
+    "dep:wgpu",
+    "dep:raw-window-handle",
+    "dep:libloading",
+    "wayland-client?/system",
+    "wayland-client?/dlopen",
+]
 
 [dependencies]
+egui = { version = "=0.32.3", optional = true }
+egui-wgpu = { version = "=0.32.3", default-features = false, optional = true }
 crossbeam-channel = "0.5"
 thiserror = "2"
-rustix = { version = "1", features = ["event", "pipe", "fs"] }
+rustix = { version = "1", features = ["event", "pipe", "fs", "time"] }
 memmap2 = { version = "0.9", optional = true }
 wayland-client = { version = "0.31", optional = true }
-wayland-protocols = { version = "0.32", features = ["client", "staging"], optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"], optional = true }
 wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
-x11rb = { version = "0.13.2", features = ["shape", "render", "randr", "present", "dri3"], optional = true }
+x11rb = { version = "0.13.2", features = ["shape", "render", "randr", "present", "dri3", "shm", "xinput", "xkb"], optional = true }
+kbvm = { version = "0.1.7", default-features = false, features = ["compose"], optional = true }
+xim = { version = "0.5", features = ["x11rb-client"], optional = true }
+xim-ctext = { version = "0.4.1", optional = true }
+# Constrain XIM’s transitive encoding dependency for downstream Rust 1.85 builds.
+encoding_rs = { version = "=0.8.35", optional = true }
 wgpu = { version = "25.0.2", default-features = false, features = ["vulkan", "wgsl"], optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]
-x11rb = { version = "0.13.2", features = ["xtest"] }
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+xim = { version = "0.5", features = ["x11rb-server"] }
+# Keep the text example compatible with Rust 1.85.
+fontdue = { version = "=0.9.3", default-features = false }
+x11rb = { version = "0.13.2", features = ["xtest", "composite"] }
+
+[[example]]
+name = "egui_input"
+required-features = ["wayland"]
 
 [[example]]
 name = "gpu_hud"
@@ -46,6 +93,7 @@ required-features = ["gpu", "wayland"]
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "deny"
 
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"

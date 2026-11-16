@@ -9,7 +9,7 @@ use std::{
     os::fd::OwnedFd,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     time::{Duration, Instant},
 };
@@ -23,12 +23,24 @@ struct State {
     info: WindowInfo,
     events: VecDeque<OverlayEvent>,
     terminal: Option<OverlayError>,
+    frames: Vec<Frame>,
+    input_reset: bool,
 }
 struct Shared {
     running: AtomicBool,
     state: Mutex<State>,
 }
 impl Shared {
+    fn recycle(&self, job: FrameJob) -> Result<()> {
+        #[allow(irrefutable_let_patterns)]
+        if let FrameJob::Cpu(frame) = job {
+            let mut state = self.state.lock().map_err(|_| OverlayError::Poisoned)?;
+            if state.frames.len() < 2 && frame.size == state.info.physical_size {
+                state.frames.push(frame);
+            }
+        }
+        Ok(())
+    }
     fn push(&self, event: OverlayEvent) -> Result<()> {
         let mut state = self.state.lock().map_err(|_| OverlayError::Poisoned)?;
         if matches!(event, OverlayEvent::PointerMoved { .. })
@@ -37,7 +49,13 @@ impl Shared {
             state.events.pop_back();
         }
         if state.events.len() == EVENT_CAPACITY {
-            state.events.pop_front();
+            state.events.clear();
+            state.events.push_back(OverlayEvent::InputReset {
+                source: None,
+                scope: crate::InputResetScope::All,
+                reason: crate::InputResetReason::QueueOverflow,
+            });
+            state.input_reset = true;
         }
         state.events.push_back(event);
         Ok(())
@@ -49,7 +67,9 @@ enum Command {
     #[cfg(feature = "gpu")]
     Gpu(WindowInfo, crate::gpu::GpuDraw),
     ClickThrough(bool, Sender<Result<()>>),
-    Close,
+    InputRegion(crate::InputRegion, Sender<Result<()>>),
+    KeyboardCapture(bool, Sender<Result<()>>),
+    TextInput(crate::TextInputState, Sender<Result<()>>),
 }
 enum FrameJob {
     Cpu(Frame),
@@ -84,12 +104,28 @@ struct Inner {
     report: BackendReport,
     timeout: Duration,
     limit: usize,
+    keyboard_enabled: bool,
 }
 
 /// Cloneable, `Send + Sync` handle to an overlay's private display runtime.
 #[derive(Clone)]
 pub struct OverlayWindow {
     inner: Arc<Inner>,
+}
+
+/// Non-owning window reference for callbacks and other lifetime-sensitive state.
+/// It does not keep the display runtime alive.
+#[derive(Debug, Clone)]
+pub struct WeakOverlayWindow {
+    inner: Weak<Inner>,
+}
+
+impl WeakOverlayWindow {
+    /// Obtains an owning handle while one still exists. The window may already
+    /// be closed; inspect `OverlayWindow::is_running` before issuing commands.
+    pub fn upgrade(&self) -> Option<OverlayWindow> {
+        self.inner.upgrade().map(|inner| OverlayWindow { inner })
+    }
 }
 impl std::fmt::Debug for OverlayWindow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -101,15 +137,26 @@ impl std::fmt::Debug for OverlayWindow {
     }
 }
 impl OverlayWindow {
+    /// Creates a non-owning reference suitable for a queued GPU callback.
+    /// Capturing a strong clone in a stalled callback can prolong window lifetime.
+    pub fn downgrade(&self) -> WeakOverlayWindow {
+        WeakOverlayWindow {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+    /// Returns the display backend selected during startup.
     pub fn backend_type(&self) -> BackendType {
         self.inner.report.backend
     }
+    /// Returns the immutable startup capabilities, fallback attempts and warnings.
     pub fn backend_report(&self) -> &BackendReport {
         &self.inner.report
     }
+    /// Returns whether the runtime is accepting commands.
     pub fn is_running(&self) -> bool {
         self.inner.shared.running.load(Ordering::Acquire)
     }
+    /// Returns the latest geometry snapshot, also available after closure.
     pub fn info(&self) -> Result<WindowInfo> {
         Ok(self
             .inner
@@ -129,7 +176,20 @@ impl OverlayWindow {
                 "CPU frames on a GPU overlay; use draw_gpu",
             ));
         }
-        let info = self.info()?;
+        let (info, recycled) = {
+            let mut state = self
+                .inner
+                .shared
+                .state
+                .lock()
+                .map_err(|_| OverlayError::Poisoned)?;
+            (state.info, state.frames.pop())
+        };
+        if let Some(mut frame) = recycled.filter(|frame| frame.size == info.physical_size) {
+            frame.generation = info.generation;
+            frame.pixels.fill(0);
+            return Ok(frame);
+        }
         Frame::new(
             info.physical_size,
             info.generation,
@@ -153,6 +213,8 @@ impl OverlayWindow {
         }
         self.send(Command::Present(frame))
     }
+    /// Obtains a transparent CPU frame, draws on the calling thread and queues it.
+    /// The callback receives physical dimensions; its panic propagates to the caller.
     pub fn draw(&self, draw: impl FnOnce(&mut [u32], u32, u32)) -> Result<()> {
         let mut frame = self.frame()?;
         let size = frame.size;
@@ -160,6 +222,8 @@ impl OverlayWindow {
         self.present(frame)
     }
     #[cfg(feature = "gpu")]
+    /// Returns cloneable GPU resources for preparing pipelines before drawing.
+    /// Device resources may outlive the window. Destroying the device closes its runtime.
     pub fn gpu_context(&self) -> Result<crate::gpu::GpuContext> {
         if !self.is_running() {
             return Err(OverlayError::Closed);
@@ -175,6 +239,10 @@ impl OverlayWindow {
     }
     /// Queues a GPU encoding callback. It runs on the display thread; prepare
     /// pipelines and resources beforehand, and avoid blocking inside callbacks.
+    /// Use `downgrade()` when the callback needs to reference this window without
+    /// keeping it alive while presentation is stalled.
+    /// Callback panics become `RuntimePanic` with `panic=unwind`; a `panic=abort`
+    /// executable retains its process-aborting behavior.
     #[cfg(feature = "gpu")]
     pub fn draw_gpu(
         &self,
@@ -203,6 +271,80 @@ impl OverlayWindow {
                 crossbeam_channel::RecvTimeoutError::Disconnected => OverlayError::Closed,
             })?
     }
+    /// Applies a pointer/touch region and disables click-through. A later
+    /// `set_click_through(true)` masks it until `set_click_through(false)`.
+    /// The reply confirms flushing, independently of render pacing; it does not
+    /// confirm when the server routes a physical input event through the region.
+    pub fn set_input_region(&self, region: crate::InputRegion) -> Result<()> {
+        region.validate()?;
+        if on_worker_thread(&self.inner.worker)? {
+            return Err(OverlayError::Unsupported(
+                "synchronous input commands from a GPU callback",
+            ));
+        }
+        let (tx, rx) = bounded(1);
+        self.send(Command::InputRegion(region, tx))?;
+        rx.recv_timeout(self.inner.timeout)
+            .map_err(|error| match error {
+                crossbeam_channel::RecvTimeoutError::Timeout => {
+                    OverlayError::Timeout("setting the input region")
+                }
+                crossbeam_channel::RecvTimeoutError::Disconnected => OverlayError::Closed,
+            })?
+    }
+    /// Captures keyboard focus for an interactive Wayland layer, or yields it.
+    /// Requires `KeyboardMode::OnDemand` at startup. Enabled requests exclusive
+    /// compositor focus; disabled requests no keyboard focus, returning control
+    /// to the underlying application. Pointer input is configured independently.
+    /// Other backends return `Unsupported`. Never call from a GPU callback.
+    pub fn set_keyboard_capture(&self, enabled: bool) -> Result<()> {
+        if !self.inner.keyboard_enabled {
+            return Err(OverlayError::Unsupported(
+                "keyboard interaction was not enabled at startup",
+            ));
+        }
+        if on_worker_thread(&self.inner.worker)? {
+            return Err(OverlayError::Unsupported(
+                "synchronous keyboard capture from a GPU callback",
+            ));
+        }
+        let (tx, rx) = bounded(1);
+        self.send(Command::KeyboardCapture(enabled, tx))?;
+        rx.recv_timeout(self.inner.timeout)
+            .map_err(|error| match error {
+                crossbeam_channel::RecvTimeoutError::Timeout => {
+                    OverlayError::Timeout("changing keyboard capture")
+                }
+                crossbeam_channel::RecvTimeoutError::Disconnected => OverlayError::Closed,
+            })?
+    }
+    /// Updates or disables the focused text field. This requires on-demand
+    /// keyboard interaction at startup. Surrounding text uses UTF-8 byte offsets;
+    /// `TextCommitted` and `TextDeleteSurrounding` must be applied by the caller.
+    pub fn set_text_input(&self, state: crate::TextInputState) -> Result<()> {
+        state.validate()?;
+        if !self.inner.keyboard_enabled {
+            return Err(OverlayError::Unsupported(
+                "text input on an overlay without keyboard interaction",
+            ));
+        }
+        if on_worker_thread(&self.inner.worker)? {
+            return Err(OverlayError::Unsupported(
+                "synchronous input commands from a GPU callback",
+            ));
+        }
+        let (tx, rx) = bounded(1);
+        self.send(Command::TextInput(state, tx))?;
+        rx.recv_timeout(self.inner.timeout)
+            .map_err(|error| match error {
+                crossbeam_channel::RecvTimeoutError::Timeout => {
+                    OverlayError::Timeout("updating text input")
+                }
+                crossbeam_channel::RecvTimeoutError::Disconnected => OverlayError::Closed,
+            })?
+    }
+    /// Drains the shared bounded event queue. Clones consume the same queue;
+    /// events are not broadcast. A fatal error is returned once, before queued events.
     pub fn poll_events(&self) -> Result<Vec<OverlayEvent>> {
         let mut state = self
             .inner
@@ -215,18 +357,17 @@ impl OverlayWindow {
         }
         Ok(state.events.drain(..).collect())
     }
+    /// Stops rendering for every clone and waits for display resource cleanup.
+    /// Closure bypasses the bounded drawing queue, including when it is full.
     pub fn close(&self) -> Result<()> {
         if on_worker_thread(&self.inner.worker)? {
             return Err(OverlayError::Unsupported(
                 "synchronous close from a GPU callback",
             ));
         }
-        if self.is_running() {
-            match self.send(Command::Close) {
-                Ok(()) | Err(OverlayError::Closed) => {}
-                Err(error) => return Err(error),
-            }
-        }
+        self.inner.shared.running.store(false, Ordering::Release);
+        // The reader may already have closed after observing the stop flag.
+        let _ = wake(&self.inner.wake);
         join_worker(&self.inner.worker, self.inner.timeout)
     }
     fn send(&self, command: Command) -> Result<()> {
@@ -244,10 +385,21 @@ impl OverlayWindow {
     }
 }
 fn wake(fd: &OwnedFd) -> Result<()> {
-    match rustix::io::write(fd, &[1]) {
+    match rustix::io::write(fd, &1u64.to_ne_bytes()) {
         Ok(_) | Err(rustix::io::Errno::AGAIN) => Ok(()),
         Err(error) => Err(std::io::Error::from(error).into()),
     }
+}
+
+fn wake_pair() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    // An eventfd has no disconnected-reader SIGPIPE. Rust executables normally
+    // ignore that signal, but C/C++ hosts may keep its default termination action.
+    let read = rustix::event::eventfd(
+        0,
+        rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+    )?;
+    let write = rustix::io::fcntl_dupfd_cloexec(&read, 0)?;
+    Ok((read, write))
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -285,7 +437,6 @@ fn join_worker(
                 // Join also waits for native thread-local destruction, beyond
                 // our Rust cleanup guard, before the caller can exit main.
                 let finished = slot.take();
-                drop(slot);
                 if let Some(handle) = finished {
                     handle.join().map_err(|_| OverlayError::RuntimePanic)?;
                 }
@@ -315,17 +466,17 @@ pub(crate) fn spawn(config: OverlayBuilder) -> Result<OverlayWindow> {
             info: initial,
             events: VecDeque::new(),
             terminal: None,
+            frames: Vec::new(),
+            input_reset: false,
         }),
     });
-    let (read, write) = rustix::pipe::pipe_with(
-        rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
-    )
-    .map_err(std::io::Error::from)?;
+    let (read, write) = wake_pair()?;
     let (tx, rx) = bounded(8);
     let (ready_tx, ready_rx) = bounded(1);
     let timeout = config.startup_timeout;
     let command_timeout = config.command_timeout;
     let limit = config.max_frame_bytes;
+    let keyboard_enabled = config.keyboard == crate::KeyboardMode::OnDemand;
     let worker_shared = shared.clone();
     let worker = std::thread::Builder::new()
         .name(format!("liboverlay-{id}"))
@@ -334,39 +485,61 @@ pub(crate) fn spawn(config: OverlayBuilder) -> Result<OverlayWindow> {
             struct RunningGuard(Arc<Shared>);
             impl Drop for RunningGuard {
                 fn drop(&mut self) {
-                    self.0.running.store(false, Ordering::Release);
+                    if let Ok(mut state) = self.0.state.lock() {
+                        state.frames.clear();
+                    }
+                    let _ = self.0.push(OverlayEvent::InputReset {
+                        source: None,
+                        scope: crate::InputResetScope::All,
+                        reason: crate::InputResetReason::Closed,
+                    });
                     let _ = self.0.push(OverlayEvent::Closed);
+                    self.0.running.store(false, Ordering::Release);
                 }
             }
             let _guard = RunningGuard(worker_shared.clone());
-            match backend::create(&config, Instant::now() + timeout) {
-                Err(error) => {
-                    let _ = ready_tx.send(Err(error));
-                }
-                Ok((mut backend, report)) => {
-                    if let Ok(mut state) = worker_shared.state.lock() {
-                        state.info = backend.info();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match backend::create(&config, Instant::now() + timeout) {
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                    }
+                    Ok((mut backend, report)) => {
+                        if let Ok(mut state) = worker_shared.state.lock() {
+                            state.info = backend.info();
+                            #[cfg(feature = "gpu")]
+                            {
+                                state.gpu = backend.gpu_context();
+                            }
+                        }
+                        if ready_tx.send(Ok(report)).is_err() {
+                            return;
+                        }
+                        let result = run(&mut *backend, rx, read, &worker_shared);
+                        // Release the runtime's exported device clone before the
+                        // backend tears down its native display connection.
                         #[cfg(feature = "gpu")]
-                        {
-                            state.gpu = backend.gpu_context();
+                        if let Ok(mut state) = worker_shared.state.lock() {
+                            state.gpu = None;
+                        }
+                        if let Err(error) = result {
+                            if let Ok(mut state) = worker_shared.state.lock() {
+                                state.terminal = Some(error);
+                            }
                         }
                     }
-                    if ready_tx.send(Ok(report)).is_err() {
-                        return;
-                    }
-                    let result = run(&mut *backend, rx, read, &worker_shared);
-                    // Release the runtime's exported device clone before the
-                    // backend tears down its native display connection.
+                }
+            }));
+            if result.is_err() {
+                // Preserve a typed error even when a rendering callback or a
+                // graphics dependency unwinds. The normal panic hook still runs.
+                if let Ok(mut state) = worker_shared.state.lock() {
                     #[cfg(feature = "gpu")]
-                    if let Ok(mut state) = worker_shared.state.lock() {
+                    {
                         state.gpu = None;
                     }
-                    if let Err(error) = result {
-                        if let Ok(mut state) = worker_shared.state.lock() {
-                            state.terminal = Some(error);
-                        }
-                    }
+                    state.terminal = Some(OverlayError::RuntimePanic);
                 }
+                let _ = ready_tx.try_send(Err(OverlayError::RuntimePanic));
             }
         })?;
     let worker = Mutex::new(Some(worker));
@@ -392,6 +565,7 @@ pub(crate) fn spawn(config: OverlayBuilder) -> Result<OverlayWindow> {
             report,
             timeout: command_timeout,
             limit,
+            keyboard_enabled,
         }),
     })
 }
@@ -400,6 +574,13 @@ fn dispatch_events(
     backend: &mut dyn OverlayBackend,
     shared: &Shared,
 ) -> Result<Option<WindowInfo>> {
+    let reset = {
+        let mut state = shared.state.lock().map_err(|_| OverlayError::Poisoned)?;
+        std::mem::take(&mut state.input_reset)
+    };
+    if reset {
+        backend.reset_input()?;
+    }
     for event in backend.dispatch()? {
         if matches!(event, OverlayEvent::Closed) {
             return Ok(None);
@@ -432,19 +613,18 @@ fn run(
         for _ in 0..64 {
             match rx.try_recv() {
                 Ok(Command::Present(frame)) => {
-                    if pending.replace(FrameJob::Cpu(frame)).is_some() {
+                    if let Some(replaced) = pending.replace(FrameJob::Cpu(frame)) {
+                        shared.recycle(replaced)?;
                         shared.push(OverlayEvent::FrameDiscarded)?;
                     }
                 }
                 #[cfg(feature = "gpu")]
                 Ok(Command::Gpu(info, draw)) => {
-                    if pending
-                        .replace(FrameJob::Gpu {
-                            info,
-                            draw: Some(draw),
-                        })
-                        .is_some()
-                    {
+                    if let Some(replaced) = pending.replace(FrameJob::Gpu {
+                        info,
+                        draw: Some(draw),
+                    }) {
+                        shared.recycle(replaced)?;
                         shared.push(OverlayEvent::FrameDiscarded)?;
                     }
                 }
@@ -463,13 +643,52 @@ fn run(
                         return Err(OverlayError::Closed);
                     }
                 }
-                Ok(Command::Close) => {
-                    shared.running.store(false, Ordering::Release);
-                    return Ok(());
+                Ok(Command::InputRegion(region, reply)) => {
+                    buffered_events_possible = true;
+                    let result = backend
+                        .set_input_region(region)
+                        .and_then(|()| backend.flush());
+                    let fatal = result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|e| !matches!(e, OverlayError::Unsupported(_)));
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(OverlayError::Closed);
+                    }
+                }
+                Ok(Command::KeyboardCapture(enabled, reply)) => {
+                    buffered_events_possible = true;
+                    let result = backend
+                        .set_keyboard_capture(enabled)
+                        .and_then(|()| backend.flush());
+                    let fatal = result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|e| !matches!(e, OverlayError::Unsupported(_)));
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(OverlayError::Closed);
+                    }
+                }
+                Ok(Command::TextInput(state, reply)) => {
+                    buffered_events_possible = true;
+                    let result = backend.set_text_input(state).and_then(|()| backend.flush());
+                    let fatal = result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|e| !matches!(e, OverlayError::Unsupported(_)));
+                    let _ = reply.send(result);
+                    if fatal {
+                        return Err(OverlayError::Closed);
+                    }
                 }
                 Err(TryRecvError::Disconnected) => return Ok(()),
                 Err(TryRecvError::Empty) => break,
             }
+        }
+        if !shared.running.load(Ordering::Acquire) {
+            return Ok(());
         }
         // A synchronous X11 reply may have read Present notifications into
         // x11rb's event queue, leaving the socket unreadable. Dispatch that queue
@@ -483,11 +702,15 @@ fn run(
         if let Some(frame) = pending.as_mut() {
             let (size, generation) = frame.geometry();
             if generation != info.generation || size != info.physical_size {
-                pending = None;
+                if let Some(discarded) = pending.take() {
+                    shared.recycle(discarded)?;
+                }
                 shared.push(OverlayEvent::FrameDiscarded)?;
             } else if frame.present(backend)? {
                 submitted = Some(generation);
-                pending = None;
+                if let Some(done) = pending.take() {
+                    shared.recycle(done)?;
+                }
             }
         }
         backend.flush()?;
@@ -497,7 +720,7 @@ fn run(
             }
         }
         // Never sleep while commands remain after the bounded drain above.
-        if !rx.is_empty() {
+        if !rx.is_empty() || backend.needs_dispatch() {
             continue;
         }
         let timeout = if pending.is_some() {
@@ -505,6 +728,9 @@ fn run(
         } else {
             None
         };
+        // Device loss must also be detected while a compositor withholds frame
+        // callbacks, or while no drawing command is pending.
+        let timeout = timeout.into_iter().chain(backend.idle_wait()).min();
         let timespec = timeout
             .map(Timespec::try_from)
             .transpose()
@@ -529,221 +755,4 @@ fn run(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::fd::AsFd;
-
-    #[test]
-    fn close_waits_for_thread_local_cleanup() {
-        struct Cleanup(Arc<AtomicBool>);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                std::thread::sleep(Duration::from_millis(30));
-                self.0.store(true, Ordering::Release);
-            }
-        }
-        std::thread_local! { static CLEANUP: std::cell::RefCell<Option<Cleanup>> = const { std::cell::RefCell::new(None) }; }
-        let (window, rx, _read) = mock_window();
-        let cleaned = Arc::new(AtomicBool::new(false));
-        let marker = cleaned.clone();
-        let shared = window.inner.shared.clone();
-        let worker = std::thread::spawn(move || {
-            CLEANUP.with(|slot| {
-                *slot.borrow_mut() = Some(Cleanup(marker));
-            });
-            assert!(matches!(rx.recv().unwrap(), Command::Close));
-            shared.running.store(false, Ordering::Release);
-        });
-        *window.inner.worker.lock().unwrap() = Some(worker);
-        window.close().unwrap();
-        assert!(cleaned.load(Ordering::Acquire));
-        assert!(!window.is_running());
-    }
-
-    fn mock_window() -> (OverlayWindow, Receiver<Command>, OwnedFd) {
-        let size = crate::Size::new(4, 4);
-        let shared = Arc::new(Shared {
-            running: AtomicBool::new(true),
-            state: Mutex::new(State {
-                #[cfg(feature = "gpu")]
-                gpu: None,
-                info: WindowInfo {
-                    logical_size: size,
-                    physical_size: size,
-                    scale_factor: crate::ScaleFactor::ONE,
-                    generation: 0,
-                },
-                events: VecDeque::new(),
-                terminal: None,
-            }),
-        });
-        let (read, write) = rustix::pipe::pipe_with(
-            rustix::pipe::PipeFlags::CLOEXEC | rustix::pipe::PipeFlags::NONBLOCK,
-        )
-        .unwrap();
-        let (tx, rx) = bounded(8);
-        let report = BackendReport {
-            gpu: None,
-            backend: BackendType::Wayland,
-            capabilities: crate::Capabilities {
-                renderer: crate::RendererType::Cpu,
-                transparency: crate::Support::Supported,
-                click_through: crate::Support::Supported,
-                keyboard_on_demand: crate::Support::Unsupported,
-                stacking: crate::StackingSupport::LayerShellOverlay,
-                frame_pacing: crate::FramePacing::CompositorCallback,
-                integer_scaling: true,
-                fractional_scaling: false,
-            },
-            fallback_attempts: Vec::new(),
-            warnings: Vec::new(),
-        };
-        let window = OverlayWindow {
-            inner: Arc::new(Inner {
-                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-                worker: Mutex::new(None),
-                tx,
-                wake: write,
-                shared,
-                report,
-                timeout: Duration::from_secs(1),
-                limit: 1024,
-            }),
-        };
-        (window, rx, read)
-    }
-
-    #[test]
-    fn stale_foreign_and_excess_frames_are_rejected() {
-        let (window, _rx, _read) = mock_window();
-        let frame = window.frame().unwrap();
-        window.inner.shared.state.lock().unwrap().info.generation += 1;
-        assert!(matches!(
-            window.present(frame),
-            Err(OverlayError::OutdatedFrame { .. })
-        ));
-        let (other, _other_rx, _other_read) = mock_window();
-        assert!(matches!(
-            window.present(other.frame().unwrap()),
-            Err(OverlayError::ForeignFrame)
-        ));
-        for _ in 0..8 {
-            window.draw(|_, _, _| {}).unwrap();
-        }
-        assert!(matches!(
-            window.draw(|_, _, _| {}),
-            Err(OverlayError::QueueFull)
-        ));
-    }
-
-    #[test]
-    fn input_commands_wake_stalled_rendering_and_dispatch_buffered_events() {
-        struct BlockedBackend {
-            socket: std::os::unix::net::UnixStream,
-            info: WindowInfo,
-            input: Arc<AtomicBool>,
-            attempted: Sender<()>,
-            submitted: Sender<()>,
-            buffered_event: bool,
-            ready: bool,
-        }
-        impl OverlayBackend for BlockedBackend {
-            fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
-                self.socket.as_fd()
-            }
-            fn info(&self) -> WindowInfo {
-                self.info
-            }
-            fn dispatch(&mut self) -> Result<Vec<OverlayEvent>> {
-                if self.buffered_event {
-                    self.buffered_event = false;
-                    self.ready = true;
-                }
-                Ok(Vec::new())
-            }
-            fn present(&mut self, _: &Frame) -> Result<bool> {
-                let _ = self.attempted.try_send(());
-                if self.ready {
-                    let _ = self.submitted.try_send(());
-                }
-                Ok(self.ready)
-            }
-            fn set_click_through(&mut self, enabled: bool) -> Result<()> {
-                self.input.store(enabled, Ordering::Release);
-                self.buffered_event = true;
-                Ok(())
-            }
-            fn flush(&mut self) -> Result<()> {
-                Ok(())
-            }
-        }
-        let (window, rx, read) = mock_window();
-        let shared = window.inner.shared.clone();
-        let input = Arc::new(AtomicBool::new(true));
-        let worker_input = input.clone();
-        let (attempted_tx, attempted_rx) = bounded(1);
-        let (submitted_tx, submitted_rx) = bounded(1);
-        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let info = window.info().unwrap();
-        let worker = std::thread::spawn(move || {
-            let mut backend = BlockedBackend {
-                socket,
-                info,
-                input: worker_input,
-                attempted: attempted_tx,
-                submitted: submitted_tx,
-                buffered_event: false,
-                ready: false,
-            };
-            run(&mut backend, rx, read, &shared)
-        });
-        window.draw(|_, _, _| {}).unwrap();
-        attempted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        window.set_click_through(false).unwrap();
-        assert!(!input.load(Ordering::Acquire));
-        submitted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        window.close().unwrap();
-        worker.join().unwrap().unwrap();
-    }
-
-    #[test]
-    fn public_handle_is_send_and_sync() {
-        fn check<T: Send + Sync>() {}
-        check::<OverlayWindow>();
-    }
-    #[test]
-    fn event_queue_bounds_motion_and_preserves_terminal_event() {
-        let size = crate::Size::new(1, 1);
-        let shared = Shared {
-            running: AtomicBool::new(true),
-            state: Mutex::new(State {
-                #[cfg(feature = "gpu")]
-                gpu: None,
-                info: WindowInfo {
-                    logical_size: size,
-                    physical_size: size,
-                    scale_factor: crate::ScaleFactor::ONE,
-                    generation: 0,
-                },
-                events: VecDeque::new(),
-                terminal: None,
-            }),
-        };
-        for n in 0..1000 {
-            shared
-                .push(OverlayEvent::PointerMoved {
-                    x: n as f64,
-                    y: 0.0,
-                })
-                .unwrap();
-        }
-        assert_eq!(shared.state.lock().unwrap().events.len(), 1);
-        for _ in 0..1000 {
-            shared.push(OverlayEvent::FrameDiscarded).unwrap();
-        }
-        shared.push(OverlayEvent::Closed).unwrap();
-        let state = shared.state.lock().unwrap();
-        assert_eq!(state.events.len(), EVENT_CAPACITY);
-        assert!(matches!(state.events.back(), Some(OverlayEvent::Closed)));
-    }
-}
+mod tests;

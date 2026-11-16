@@ -1,4 +1,6 @@
 use super::OverlayBackend;
+mod input;
+mod presentation;
 use crate::{
     Anchor, BackendReport, BackendType, ButtonState, Capabilities, Frame, FramePacing,
     KeyboardMode, OutputSelector, OverlayBuilder, OverlayError, OverlayEvent, Result, ScaleFactor,
@@ -15,7 +17,7 @@ use wayland_client::{
     delegate_noop,
     protocol::{
         wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region,
-        wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+        wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface, wl_touch,
     },
     Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum,
 };
@@ -38,6 +40,10 @@ enum Callback {
     Frame(u64),
 }
 struct State {
+    presentation: Option<presentation::Manager>,
+    presentation_clock: Option<u32>,
+    feedbacks: BTreeMap<u64, presentation::Feedback>,
+    next_submission: u64,
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     shell: Option<shell::ZwlrLayerShellV1>,
@@ -51,6 +57,13 @@ struct State {
     seats: BTreeMap<u32, wl_seat::WlSeat>,
     pointers: BTreeMap<u32, wl_pointer::WlPointer>,
     keyboards: BTreeMap<u32, wl_keyboard::WlKeyboard>,
+    keyboard_states: BTreeMap<u32, crate::input::keyboard::Keyboard>,
+    text_input: crate::TextInputState,
+    text_manager: Option<input::TextManager>,
+    text_inputs: BTreeMap<u32, input::TextInput>,
+    input_error: Option<OverlayError>,
+    touches: BTreeMap<u32, wl_touch::WlTouch>,
+    touch_state: crate::input::touch::TouchTracker,
     keyboard_mode: KeyboardMode,
     has_argb: bool,
     sync_done: bool,
@@ -67,6 +80,10 @@ struct State {
 impl State {
     fn new(config: &OverlayBuilder) -> Self {
         Self {
+            presentation: None,
+            presentation_clock: None,
+            feedbacks: BTreeMap::new(),
+            next_submission: 0,
             compositor: None,
             shm: None,
             shell: None,
@@ -80,6 +97,13 @@ impl State {
             seats: BTreeMap::new(),
             pointers: BTreeMap::new(),
             keyboards: BTreeMap::new(),
+            keyboard_states: BTreeMap::new(),
+            text_input: config.text_input.clone(),
+            text_manager: None,
+            text_inputs: BTreeMap::new(),
+            input_error: None,
+            touches: BTreeMap::new(),
+            touch_state: crate::input::touch::TouchTracker::default(),
             keyboard_mode: config.keyboard,
             has_argb: false,
             sync_done: false,
@@ -142,6 +166,9 @@ impl Drop for Slot {
 }
 
 pub(crate) struct WaylandBackend {
+    feedback_enabled: bool,
+    damage: crate::damage::Tracker,
+    last_presented_slot: Option<u64>,
     #[cfg(feature = "gpu")]
     gpu: Option<crate::gpu::GpuSurface>,
     conn: Connection,
@@ -159,6 +186,7 @@ pub(crate) struct WaylandBackend {
     limit: usize,
     write_blocked: bool,
     timeout: Duration,
+    input_region: crate::InputRegion,
 }
 impl WaylandBackend {
     pub(crate) fn create(
@@ -247,13 +275,16 @@ impl WaylandBackend {
             KeyboardMode::None => layer::KeyboardInteractivity::None,
             KeyboardMode::OnDemand => layer::KeyboardInteractivity::OnDemand,
         });
-        if config.click_through {
-            let region = compositor.create_region(&qh, ());
-            surface.set_input_region(Some(&region));
-            region.destroy();
-        } else {
-            surface.set_input_region(None);
-        }
+        apply_region(
+            &surface,
+            &compositor,
+            &qh,
+            if config.click_through {
+                &crate::InputRegion::Empty
+            } else {
+                &config.input_region
+            },
+        );
         state.surface = Some(surface.clone());
         surface.commit();
         while state.configured.is_none() && !state.closed {
@@ -279,6 +310,9 @@ impl WaylandBackend {
         let shell_version = shell.version();
         let fractional_scaling = viewport.is_some();
         let mut backend = Self {
+            feedback_enabled: false,
+            damage: crate::damage::Tracker::new(config.cpu_damage_tracking),
+            last_presented_slot: None,
             #[cfg(feature = "gpu")]
             gpu: None,
             conn,
@@ -296,6 +330,7 @@ impl WaylandBackend {
             limit: config.max_frame_bytes,
             write_blocked: false,
             timeout: config.command_timeout,
+            input_region: config.input_region.clone(),
         };
         let mut warnings = vec!["Layer-shell controls desktop layering; lock screens and compositor UI remain compositor policy.".into()];
         if !fractional_scaling {
@@ -342,7 +377,54 @@ impl WaylandBackend {
             let initial = Frame::new(physical, 0, 0, config.max_frame_bytes)?;
             backend.present(&initial)?;
         }
+        backend.feedback_enabled = config.presentation_feedback;
         backend.flush()?;
+        let translated = if backend
+            .state
+            .keyboard_states
+            .values()
+            .any(|k| k.table.is_some())
+        {
+            Support::Supported
+        } else {
+            Support::Unsupported
+        };
+        let input_method = if backend.state.text_manager.is_some() {
+            Support::Supported
+        } else {
+            Support::Unsupported
+        };
+        let composed = if input_method == Support::Supported
+            || backend
+                .state
+                .keyboard_states
+                .values()
+                .any(|k| k.has_compose())
+        {
+            Support::Supported
+        } else {
+            Support::Unsupported
+        };
+        let touch = if backend.state.touches.is_empty() {
+            Support::Unsupported
+        } else {
+            Support::Supported
+        };
+        if config.text_input.enabled && input_method == Support::Unsupported {
+            warnings.push(
+                "text-input-v3 is unavailable; text input uses local XCompose tables.".into(),
+            );
+        }
+        if config.keyboard == KeyboardMode::OnDemand && composed == Support::Unsupported {
+            warnings.push(
+                "XCompose tables are unavailable; only individual-key text is available.".into(),
+            );
+        }
+        let presentation_feedback = if backend.state.presentation.is_some() {
+            Support::Supported
+        } else {
+            Support::Unsupported
+        };
         Ok((
             backend,
             BackendReport {
@@ -352,6 +434,12 @@ impl WaylandBackend {
                     renderer,
                     transparency,
                     click_through: Support::Supported,
+                    input_regions: Support::Supported,
+                    keyboard_translation: translated,
+                    text_composition: composed,
+                    input_method,
+                    surrounding_text: input_method,
+                    touch,
                     keyboard_on_demand: if shell_version >= 4 {
                         Support::Supported
                     } else {
@@ -364,6 +452,7 @@ impl WaylandBackend {
                         FramePacing::CompositorCallback
                     },
                     integer_scaling: true,
+                    presentation_feedback,
                     fractional_scaling,
                 },
                 fallback_attempts: Vec::new(),
@@ -501,6 +590,14 @@ impl OverlayBackend for WaylandBackend {
                 slot.busy = false;
             }
         }
+        if let Some(error) = self.state.input_error.take() {
+            return Err(error);
+        }
+        for keyboard in self.state.keyboard_states.values_mut() {
+            self.state
+                .events
+                .extend(keyboard.tick(self.state.text_input.enabled));
+        }
         let mut events = std::mem::take(&mut self.state.events);
         if self.state.closed {
             events.push(OverlayEvent::Closed);
@@ -544,40 +641,144 @@ impl OverlayBackend for WaylandBackend {
             None if self.slots.len() < 3 => self.allocate_slot()?,
             None => return Ok(false),
         };
+        let damage = self.damage.update(frame)?;
+        if damage.is_none() {
+            // Flush an empty commit to preserve FrameSubmitted's transport
+            // contract, without requesting a callback that may never repaint.
+            self.skip_presentation();
+            self.surface.commit();
+            return Ok(true);
+        }
         self.prepare_surface()?;
         self.request_frame();
+        self.request_presentation();
         let slot = &mut self.slots[index];
-        for (destination, pixel) in slot.map.chunks_exact_mut(4).zip(&frame.pixels) {
-            destination.copy_from_slice(&pixel.to_le_bytes());
+        let copy = if self.last_presented_slot == Some(slot.id) {
+            damage
+        } else {
+            Some(crate::damage::Rectangle::full(frame.size))
+        };
+        if let Some(rectangle) = copy {
+            for y in rectangle.y..rectangle.y + rectangle.height {
+                let first = (y * frame.size.width + rectangle.x) as usize;
+                let last = first + rectangle.width as usize;
+                for (destination, pixel) in slot.map[first * 4..last * 4]
+                    .chunks_exact_mut(4)
+                    .zip(&frame.pixels[first..last])
+                {
+                    destination.copy_from_slice(&pixel.to_ne_bytes());
+                }
+            }
         }
         self.surface.attach(Some(&slot.buffer), 0, 0);
-        if self.surface.version() >= 4 {
-            self.surface
-                .damage_buffer(0, 0, frame.size.width as i32, frame.size.height as i32);
-        } else {
-            self.surface.damage(
-                0,
-                0,
-                self.info.logical_size.width as i32,
-                self.info.logical_size.height as i32,
-            );
+        if let Some(rectangle) = damage {
+            if self.surface.version() >= 4 {
+                self.surface.damage_buffer(
+                    rectangle.x as i32,
+                    rectangle.y as i32,
+                    rectangle.width as i32,
+                    rectangle.height as i32,
+                );
+            } else {
+                // Logical rounding must cover every changed physical pixel.
+                self.surface.damage(
+                    0,
+                    0,
+                    self.info.logical_size.width as i32,
+                    self.info.logical_size.height as i32,
+                );
+            }
         }
+        self.last_presented_slot = Some(slot.id);
         self.surface.commit();
         slot.busy = true;
         self.state.frame_ready = false;
         Ok(true)
     }
     fn set_click_through(&mut self, enabled: bool) -> Result<()> {
-        if enabled {
-            let region = self.compositor.create_region(&self.queue.handle(), ());
-            self.surface.set_input_region(Some(&region));
-            region.destroy();
-        } else {
-            self.surface.set_input_region(None);
-        }
+        apply_region(
+            &self.surface,
+            &self.compositor,
+            &self.queue.handle(),
+            if enabled {
+                &crate::InputRegion::Empty
+            } else {
+                &self.input_region
+            },
+        );
         self.surface.commit();
         flush_until(&self.conn, Instant::now() + self.timeout)?;
         self.write_blocked = false;
+        Ok(())
+    }
+    fn reset_input(&mut self) -> Result<()> {
+        self.state
+            .events
+            .extend(self.state.touch_state.cancel(None, None));
+        for keyboard in self.state.keyboard_states.values_mut() {
+            keyboard.reset();
+        }
+        self.state.refresh_text_inputs(true);
+        Ok(())
+    }
+    fn set_text_input(&mut self, text: crate::TextInputState) -> Result<()> {
+        text.validate()?;
+        if self.state.keyboard_mode != KeyboardMode::OnDemand {
+            return Err(OverlayError::Unsupported(
+                "text input without on-demand keyboard interaction",
+            ));
+        }
+        let reset = !text.enabled || text.change_cause == crate::TextChangeCause::Other;
+        self.state.text_input = text;
+        if reset {
+            for keyboard in self.state.keyboard_states.values_mut() {
+                keyboard.reset_compose();
+                self.state.events.push(OverlayEvent::TextPreedit {
+                    source: keyboard.source,
+                    text: String::new(),
+                    cursor: None,
+                });
+            }
+        }
+        self.state.refresh_text_inputs(false);
+        flush_until(&self.conn, Instant::now() + self.timeout)?;
+        Ok(())
+    }
+    fn set_input_region(&mut self, region: crate::InputRegion) -> Result<()> {
+        region.validate()?;
+        apply_region(
+            &self.surface,
+            &self.compositor,
+            &self.queue.handle(),
+            &region,
+        );
+        self.surface.commit();
+        flush_until(&self.conn, Instant::now() + self.timeout)?;
+        self.write_blocked = false;
+        self.input_region = region;
+        Ok(())
+    }
+    fn set_keyboard_capture(&mut self, enabled: bool) -> Result<()> {
+        if self.state.keyboard_mode == KeyboardMode::None {
+            return Err(OverlayError::Unsupported(
+                "keyboard interaction was not enabled at startup",
+            ));
+        }
+        self.layer.set_keyboard_interactivity(if enabled {
+            layer::KeyboardInteractivity::Exclusive
+        } else {
+            layer::KeyboardInteractivity::None
+        });
+        if !enabled {
+            self.reset_input()?;
+            self.state.events.push(OverlayEvent::InputReset {
+                source: None,
+                scope: crate::InputResetScope::All,
+                reason: crate::InputResetReason::Cancelled,
+            });
+        }
+        self.surface.commit();
+        flush_until(&self.conn, Instant::now() + self.timeout)?;
         Ok(())
     }
     fn flush(&mut self) -> Result<()> {
@@ -621,6 +822,7 @@ impl OverlayBackend for WaylandBackend {
         };
         self.prepare_surface()?;
         self.request_frame();
+        self.request_presentation();
         self.gpu
             .as_ref()
             .ok_or(OverlayError::Unsupported("GPU renderer"))?
@@ -634,6 +836,22 @@ impl OverlayBackend for WaylandBackend {
             return Some(Duration::from_millis(2));
         }
         None
+    }
+    fn needs_dispatch(&self) -> bool {
+        !self.state.events.is_empty()
+    }
+    fn idle_wait(&self) -> Option<Duration> {
+        let repeat = self
+            .state
+            .keyboard_states
+            .values()
+            .filter_map(|k| k.repeat_wait())
+            .min();
+        #[cfg(feature = "gpu")]
+        let gpu = self.gpu.is_some().then_some(Duration::from_millis(250));
+        #[cfg(not(feature = "gpu"))]
+        let gpu = None;
+        repeat.into_iter().chain(gpu).min()
     }
 }
 impl Drop for WaylandBackend {
@@ -731,6 +949,31 @@ fn anchors(anchor: Anchor) -> layer::Anchor {
     }
 }
 
+fn apply_region(
+    surface: &wl_surface::WlSurface,
+    compositor: &wl_compositor::WlCompositor,
+    qh: &QueueHandle<State>,
+    input: &crate::InputRegion,
+) {
+    if matches!(input, crate::InputRegion::Full) {
+        surface.set_input_region(None);
+        return;
+    }
+    let region = compositor.create_region(qh, ());
+    if let crate::InputRegion::Rectangles(rectangles) = input {
+        for rect in rectangles {
+            region.add(
+                i32::from(rect.x),
+                i32::from(rect.y),
+                i32::from(rect.width),
+                i32::from(rect.height),
+            );
+        }
+    }
+    surface.set_input_region(Some(&region));
+    region.destroy();
+}
+
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
     fn event(
         state: &mut Self,
@@ -748,6 +991,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             } => match interface.as_str() {
                 "wl_compositor" if state.compositor.is_none() => {
                     state.compositor = Some(registry.bind(name, version.min(4), qh, ()))
+                }
+                "wp_presentation" if state.presentation.is_none() => {
+                    state.presentation = Some(registry.bind(name, 1, qh, ()));
                 }
                 "wl_shm" if state.shm.is_none() => state.shm = Some(registry.bind(name, 1, qh, ())),
                 "wp_viewporter" if state.viewporter.is_none() => {
@@ -775,6 +1021,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     let seat = registry.bind(name, version.min(5), qh, name);
                     state.seats.insert(name, seat);
                 }
+                "zwp_text_input_manager_v3"
+                    if state.keyboard_mode == KeyboardMode::OnDemand
+                        && state.text_manager.is_none() =>
+                {
+                    state.text_manager = Some(registry.bind(name, 1, qh, ()));
+                }
                 _ => {}
             },
             wl_registry::Event::GlobalRemove { name } => {
@@ -797,14 +1049,29 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         keyboard.release();
                     }
                 }
+                if let Some(mut keyboard) = state.keyboard_states.remove(&name) {
+                    state.events.extend(keyboard.focus(false));
+                }
+                if let Some(text) = state.text_inputs.remove(&name) {
+                    text.proxy.destroy();
+                }
                 if let Some(seat) = state.seats.remove(&name) {
                     if seat.version() >= 5 {
                         seat.release();
                     }
                 }
+                if let Some(touch) = state.touches.remove(&name) {
+                    state
+                        .events
+                        .extend(state.touch_state.cancel(Some(name), None));
+                    if touch.version() >= 3 {
+                        touch.release();
+                    }
+                }
             }
             _ => {}
         }
+        state.ensure_text_inputs(qh);
     }
 }
 impl Dispatch<wl_output::WlOutput, u32> for State {
@@ -923,119 +1190,6 @@ impl Dispatch<wl_buffer::WlBuffer, u64> for State {
     ) {
         if let wl_buffer::Event::Release = event {
             state.released.push(*id);
-        }
-    }
-}
-impl Dispatch<wl_seat::WlSeat, u32> for State {
-    fn event(
-        state: &mut Self,
-        seat: &wl_seat::WlSeat,
-        event: wl_seat::Event,
-        id: &u32,
-        _: &Connection,
-        qh: &QueueHandle<Self>,
-    ) {
-        if let wl_seat::Event::Capabilities {
-            capabilities: WEnum::Value(capabilities),
-        } = event
-        {
-            if capabilities.contains(wl_seat::Capability::Pointer) {
-                state
-                    .pointers
-                    .entry(*id)
-                    .or_insert_with(|| seat.get_pointer(qh, ()));
-            } else if let Some(pointer) = state.pointers.remove(id) {
-                if pointer.version() >= 3 {
-                    pointer.release();
-                }
-            }
-            if capabilities.contains(wl_seat::Capability::Keyboard)
-                && state.keyboard_mode == KeyboardMode::OnDemand
-            {
-                state
-                    .keyboards
-                    .entry(*id)
-                    .or_insert_with(|| seat.get_keyboard(qh, ()));
-            } else if let Some(keyboard) = state.keyboards.remove(id) {
-                if keyboard.version() >= 3 {
-                    keyboard.release();
-                }
-            }
-        }
-    }
-}
-impl Dispatch<wl_pointer::WlPointer, ()> for State {
-    fn event(
-        state: &mut Self,
-        _: &wl_pointer::WlPointer,
-        event: wl_pointer::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        let event = match event {
-            wl_pointer::Event::Enter {
-                surface_x,
-                surface_y,
-                ..
-            } => {
-                state.events.push(OverlayEvent::PointerEntered);
-                Some(OverlayEvent::PointerMoved {
-                    x: surface_x,
-                    y: surface_y,
-                })
-            }
-            wl_pointer::Event::Leave { .. } => Some(OverlayEvent::PointerLeft),
-            wl_pointer::Event::Motion {
-                surface_x,
-                surface_y,
-                ..
-            } => Some(OverlayEvent::PointerMoved {
-                x: surface_x,
-                y: surface_y,
-            }),
-            wl_pointer::Event::Button {
-                button,
-                state: WEnum::Value(button_state),
-                ..
-            } => Some(OverlayEvent::PointerButton {
-                button,
-                state: if button_state == wl_pointer::ButtonState::Pressed {
-                    ButtonState::Pressed
-                } else {
-                    ButtonState::Released
-                },
-            }),
-            _ => None,
-        };
-        if let Some(event) = event {
-            state.events.push(event);
-        }
-    }
-}
-impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
-    fn event(
-        state: &mut Self,
-        _: &wl_keyboard::WlKeyboard,
-        event: wl_keyboard::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-        if let wl_keyboard::Event::Key {
-            key,
-            state: WEnum::Value(key_state),
-            ..
-        } = event
-        {
-            state.events.push(OverlayEvent::Key {
-                code: key,
-                state: if key_state == wl_keyboard::KeyState::Pressed {
-                    ButtonState::Pressed
-                } else {
-                    ButtonState::Released
-                },
-            });
         }
     }
 }

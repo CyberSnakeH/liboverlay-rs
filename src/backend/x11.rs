@@ -5,14 +5,13 @@ use crate::{
     Size, StackingPolicy, StackingSupport, Support, WindowInfo,
 };
 use std::{
-    cell::Cell,
-    io,
     os::fd::{AsFd, BorrowedFd},
+    rc::Rc,
     time::{Duration, Instant},
 };
 use x11rb::{
     connection::{Connection, RequestConnection},
-    properties::WmHints,
+    properties::{WmHints, WmSizeHints, WmSizeHintsSpecification},
     protocol::{
         present::{self, ConnectionExt as _},
         randr::{self, ConnectionExt as _},
@@ -21,167 +20,24 @@ use x11rb::{
         xproto::*,
         Event,
     },
-    reexports::x11rb_protocol::{parse_display, xauth},
-    rust_connection::{DefaultStream, PollMode, RustConnection, Stream},
-    utils::RawFdContainer,
     wrapper::ConnectionExt as _,
 };
 
-struct TimedStream {
-    inner: DefaultStream,
-    deadline: Cell<Option<Instant>>,
-    timeout: Duration,
-}
-impl AsFd for TimedStream {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.inner.as_fd()
-    }
-}
-impl Stream for TimedStream {
-    fn poll(&self, mode: PollMode) -> io::Result<()> {
-        use rustix::event::{poll, PollFd, PollFlags, Timespec};
-        let deadline = self
-            .deadline
-            .get()
-            .unwrap_or_else(|| Instant::now() + self.timeout);
-        loop {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::TimedOut, "X11 server did not respond")
-                })?;
-            let mut flags = PollFlags::empty();
-            if mode.readable() {
-                flags |= PollFlags::IN;
-            }
-            if mode.writable() {
-                flags |= PollFlags::OUT;
-            }
-            let mut fds = [PollFd::new(self, flags)];
-            let timeout = Timespec::try_from(remaining).map_err(io::Error::other)?;
-            match poll(&mut fds, Some(&timeout)) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "X11 server did not respond",
-                    ))
-                }
-                Ok(_) => return Ok(()),
-                Err(rustix::io::Errno::INTR) => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-    fn read(&self, bytes: &mut [u8], fds: &mut Vec<RawFdContainer>) -> io::Result<usize> {
-        self.inner.read(bytes, fds)
-    }
-    fn write(&self, bytes: &[u8], fds: &mut Vec<RawFdContainer>) -> io::Result<usize> {
-        self.inner.write(bytes, fds)
-    }
-    fn write_vectored(
-        &self,
-        bytes: &[io::IoSlice<'_>],
-        fds: &mut Vec<RawFdContainer>,
-    ) -> io::Result<usize> {
-        self.inner.write_vectored(bytes, fds)
-    }
-}
-type XConnection = RustConnection<TimedStream>;
-
-// COPY prevents a flip from keeping our single upload pixmap busy until a
-// subsequent frame. Both notifications are required before its next upload:
-// Idle permits reuse, Complete supplies the next vertical-blank target.
-struct PresentState {
-    event: present::Event,
-    serial: u32,
-    idle: bool,
-    complete: bool,
-    msc: u64,
-}
-impl PresentState {
-    fn new(event: present::Event) -> Self {
-        Self {
-            event,
-            serial: 0,
-            idle: true,
-            complete: true,
-            msc: 0,
-        }
-    }
-    fn ready(&self) -> bool {
-        self.idle && self.complete
-    }
-    fn submitted(&mut self) {
-        self.serial = self.serial.wrapping_add(1);
-        self.idle = false;
-        self.complete = false;
-    }
-    fn completed(&mut self, serial: u32, msc: u64) {
-        if serial == self.serial {
-            self.complete = true;
-            self.msc = msc;
-        }
-    }
-    fn released(&mut self, serial: u32) {
-        if serial == self.serial {
-            self.idle = true;
-        }
-    }
-}
-
-fn connect(config: &OverlayBuilder, deadline: Instant) -> Result<(XConnection, usize, String)> {
-    let display_name =
-        std::env::var("DISPLAY").map_err(|e| crate::error::backend_error("X11", e))?;
-    let display = parse_display::parse_display(Some(&display_name))
-        .map_err(|e| crate::error::backend_error("X11", e))?;
-    // The address iterator computes an optional TCP port as u16, even when
-    // only its Unix-socket addresses are used below.
-    if display.display > u16::MAX - 6000 {
-        return Err(OverlayError::InvalidConfiguration(
-            "X11 display number is out of range".into(),
-        ));
-    }
-    let screen = usize::from(display.screen);
-    let mut last = None;
-    for address in display.connect_instruction() {
-        // The initial release deliberately supports local Unix sockets only,
-        // avoiding unbounded DNS/TCP connection attempts in the display worker.
-        if !matches!(address, parse_display::ConnectAddress::Socket(_)) {
-            continue;
-        }
-        match DefaultStream::connect(&address) {
-            Ok((stream, (family, address))) => {
-                let auth = match xauth::get_auth(family, &address, display.display) {
-                    Ok(auth) => auth,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                    Err(error) => return Err(error.into()),
-                };
-                let (auth_name, auth_data) = auth.unwrap_or_default();
-                let stream = TimedStream {
-                    inner: stream,
-                    deadline: Cell::new(Some(deadline)),
-                    timeout: config.command_timeout,
-                };
-                return Ok((
-                    RustConnection::connect_to_stream_with_auth_info(
-                        stream, screen, auth_name, auth_data,
-                    )?,
-                    screen,
-                    display_name,
-                ));
-            }
-            Err(error) => last = Some(error),
-        }
-    }
-    Err(last
-        .map(OverlayError::Io)
-        .unwrap_or(OverlayError::Unsupported("local X11 Unix socket")))
-}
+mod connection;
+mod geometry;
+mod ime;
+mod keyboard;
+mod pacing;
+mod shm;
+mod touch;
+use connection::{connect, XConnection};
+use geometry::{anchored_size, monitor_geometry, placement};
+use pacing::PresentState;
 
 pub(crate) struct X11Backend {
     #[cfg(feature = "gpu")]
     gpu: Option<crate::gpu::GpuSurface>,
-    conn: XConnection,
+    conn: Rc<XConnection>,
     window: Window,
     pixmap: Pixmap,
     gc: Gcontext,
@@ -192,10 +48,29 @@ pub(crate) struct X11Backend {
     limit: usize,
     delete_atom: Atom,
     protocols_atom: Atom,
+    user_time_atom: Option<Atom>,
     last_present: Option<Instant>,
+    feedback_enabled: bool,
+    next_submission: u64,
+    pending_feedback: Option<(u32, u64, u64)>,
+    damage: crate::damage::Tracker,
     interval: Duration,
     present: Option<PresentState>,
     repaint: bool,
+    root: Window,
+    output: OutputSelector,
+    anchor: Anchor,
+    margin: u32,
+    requested_size: Size,
+    dispatch_again: bool,
+    upload: Option<shm::Upload>,
+    input_region: crate::InputRegion,
+    touch: Option<touch::TouchInput>,
+    pending_input: Vec<OverlayEvent>,
+    keyboard: Option<keyboard::KeyboardInput>,
+    text_input: crate::TextInputState,
+    ime: Option<ime::Ime>,
+    retired_ime_windows: std::collections::BTreeSet<u32>,
 }
 
 impl X11Backend {
@@ -209,8 +84,16 @@ impl X11Backend {
             ));
         }
         let (conn, screen_number, _display_name) = connect(config, deadline)?;
+        let conn = Rc::new(conn);
         let screen = &conn.setup().roots[screen_number];
         let root = screen.root;
+        // RandR monitor definitions also change through core root ConfigureNotify
+        // events, including changes that leave the overall screen size intact.
+        conn.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+        )?
+        .check()?;
         let shape = if conn
             .extension_information(shape::X11_EXTENSION_NAME)?
             .is_some()
@@ -318,24 +201,22 @@ impl X11Backend {
         {
             return Err(OverlayError::Unsupported("standard X11 RGB channel masks"));
         }
-        let (mx, my, mw, mh) = monitor_geometry(
-            &conn,
-            root,
-            screen.width_in_pixels,
-            screen.height_in_pixels,
-            &config.output,
-            &mut warnings,
-        )?;
-        let size = if config.anchor == Anchor::Fill {
-            Size::new(
-                mw.checked_sub(config.margin * 2)
-                    .ok_or(OverlayError::InvalidSize(config.size))?,
-                mh.checked_sub(config.margin * 2)
-                    .ok_or(OverlayError::InvalidSize(config.size))?,
-            )
-        } else {
-            config.size
-        };
+        let (mx, my, mw, mh) = monitor_geometry(&conn, root, &config.output, &mut warnings)?
+            .ok_or(OverlayError::Unsupported("requested X11 monitor name"))?;
+        if conn
+            .extension_information(randr::X11_EXTENSION_NAME)?
+            .is_some()
+        {
+            let version = conn.randr_query_version(1, 5)?.reply()?;
+            let mut mask = randr::NotifyMask::SCREEN_CHANGE;
+            if (version.major_version, version.minor_version) >= (1, 5) {
+                mask |= randr::NotifyMask::CRTC_CHANGE
+                    | randr::NotifyMask::OUTPUT_CHANGE
+                    | randr::NotifyMask::RESOURCE_CHANGE;
+            }
+            conn.randr_select_input(root, mask)?.check()?;
+        }
+        let size = anchored_size(config.anchor, config.margin, config.size, (mx, my, mw, mh))?;
         size.byte_len(config.max_frame_bytes)?;
         let (x, y) = placement(config.anchor, config.margin, size, (mx, my, mw, mh))?;
         let colormap = conn.generate_id()?;
@@ -368,7 +249,8 @@ impl X11Backend {
                         | EventMask::ENTER_WINDOW
                         | EventMask::LEAVE_WINDOW
                         | EventMask::KEY_PRESS
-                        | EventMask::KEY_RELEASE,
+                        | EventMask::KEY_RELEASE
+                        | EventMask::FOCUS_CHANGE,
                 ),
         )?
         .check()?;
@@ -442,7 +324,36 @@ impl X11Backend {
         } else {
             StackingSupport::UnmanagedRaise
         };
+        let mut user_time_atom = None;
         if managed {
+            // A keyboard-capable overlay may receive focus after user interaction,
+            // but mapping it must not activate it over the current application.
+            let user_time = atom(&conn, b"_NET_WM_USER_TIME")?;
+            user_time_atom = Some(user_time);
+            conn.change_property32(
+                PropMode::REPLACE,
+                window,
+                user_time,
+                AtomEnum::CARDINAL,
+                &[0],
+            )?
+            .check()?;
+            let motif = atom(&conn, b"_MOTIF_WM_HINTS")?;
+            // MWM_HINTS_DECORATIONS; an empty decorations field requests no frame.
+            conn.change_property32(PropMode::REPLACE, window, motif, motif, &[2, 0, 0, 0, 0])?
+                .check()?;
+            let mut size_hints = WmSizeHints::new();
+            size_hints.position = Some((
+                WmSizeHintsSpecification::ProgramSpecified,
+                x.into(),
+                y.into(),
+            ));
+            size_hints.size = Some((
+                WmSizeHintsSpecification::ProgramSpecified,
+                size.width as i32,
+                size.height as i32,
+            ));
+            size_hints.set_normal_hints(&conn, window)?.check()?;
             let above = atom(&conn, b"_NET_WM_STATE_ABOVE")?;
             let state = atom(&conn, b"_NET_WM_STATE")?;
             let supported = atom(&conn, b"_NET_SUPPORTED")?;
@@ -466,6 +377,38 @@ impl X11Backend {
             scale_factor: crate::ScaleFactor::ONE,
             generation: 0,
         };
+        let touch = touch::TouchInput::new(&conn, root, window)?;
+        let keyboard = if config.keyboard == KeyboardMode::OnDemand {
+            match keyboard::KeyboardInput::new(&conn) {
+                Ok(keyboard) => Some(keyboard),
+                Err(error) if !config.text_input.enabled => {
+                    warnings.push(format!(
+                        "XKB unavailable; raw keyboard events only: {error}"
+                    ));
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
+        let ime = if let Some(keyboard) = &keyboard {
+            match ime::Ime::new(
+                conn.clone(),
+                screen_number,
+                window,
+                keyboard.keyboard.source,
+                config.text_input.clone(),
+            ) {
+                Ok(ime) => ime,
+                Err(error) => {
+                    warnings.push(format!("XIM unavailable; using local composition: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let mut backend = Self {
             #[cfg(feature = "gpu")]
             gpu: None,
@@ -480,10 +423,29 @@ impl X11Backend {
             limit: config.max_frame_bytes,
             delete_atom,
             protocols_atom,
+            user_time_atom,
             last_present: None,
+            feedback_enabled: config.presentation_feedback,
+            next_submission: 0,
+            pending_feedback: None,
+            damage: crate::damage::Tracker::new(config.cpu_damage_tracking),
             interval: config.frame_interval,
             present: None,
             repaint: false,
+            root,
+            output: config.output.clone(),
+            anchor: config.anchor,
+            margin: config.margin,
+            requested_size: config.size,
+            dispatch_again: false,
+            upload: None,
+            input_region: config.input_region.clone(),
+            touch,
+            pending_input: Vec::new(),
+            keyboard,
+            text_input: config.text_input.clone(),
+            ime,
+            retired_ime_windows: std::collections::BTreeSet::new(),
         };
         backend.set_click_through(config.click_through)?;
         backend.conn.map_window(window)?.check()?;
@@ -497,7 +459,7 @@ impl X11Backend {
                 .check()?;
         }
         backend.conn.flush()?;
-        backend.conn.stream().deadline.set(None);
+        backend.conn.stream().finish_startup();
         if config.renderer != crate::RendererPreference::Cpu {
             #[cfg(feature = "gpu")]
             if let Err(err) = backend.init_gpu(
@@ -545,6 +507,21 @@ impl X11Backend {
                 backend.present_gpu(&mut clear, info)?;
             }
         } else {
+            match shm::Upload::supported(&backend.conn).and_then(|supported| {
+                if supported {
+                    shm::Upload::create(&backend.conn, size, backend.limit).map(Some)
+                } else {
+                    Ok(None)
+                }
+            }) {
+                Ok(upload) => backend.upload = upload,
+                Err(error) => warnings.push(format!(
+                    "MIT-SHM initialization failed; using PutImage: {error}"
+                )),
+            }
+            if backend.upload.is_none() {
+                warnings.push("MIT-SHM FD transport unavailable; CPU uploads use PutImage.".into());
+            }
             match backend.enable_present() {
                 Ok(true) => {},
                 Ok(false) => warnings.push("X11 Present unavailable; pacing uses a timer without vertical synchronization.".into()),
@@ -562,6 +539,45 @@ impl X11Backend {
             && gpu_info
                 .as_ref()
                 .is_none_or(|gpu| gpu.alpha_mode != "Opaque");
+        let translated = if backend.keyboard.is_some() {
+            Support::Supported
+        } else {
+            Support::Unsupported
+        };
+        let input_method = if backend.ime.is_some() {
+            Support::Supported
+        } else {
+            Support::Unsupported
+        };
+        let composed = if backend.ime.is_some()
+            || backend
+                .keyboard
+                .as_ref()
+                .is_some_and(|k| k.keyboard.has_compose())
+        {
+            Support::Supported
+        } else {
+            Support::Unsupported
+        };
+        let touch = if backend.touch.is_some() {
+            Support::Supported
+        } else {
+            Support::Unsupported
+        };
+        if config.text_input.enabled && backend.ime.is_none() {
+            warnings.push("No XIM server was found; text input uses local XCompose tables.".into());
+        }
+        if backend.keyboard.is_some() && composed == Support::Unsupported {
+            warnings.push(
+                "XCompose tables are unavailable; only individual-key text is available.".into(),
+            );
+        }
+        let presentation_feedback =
+            if renderer == crate::RendererType::Cpu && backend.present.is_some() {
+                Support::Supported
+            } else {
+                Support::Unsupported
+            };
         Ok((
             backend,
             BackendReport {
@@ -580,8 +596,19 @@ impl X11Backend {
                         Support::Unsupported
                     },
                     keyboard_on_demand: Support::Supported,
+                    input_regions: if shape {
+                        Support::Supported
+                    } else {
+                        Support::Unsupported
+                    },
+                    keyboard_translation: translated,
+                    text_composition: composed,
+                    input_method,
+                    surrounding_text: Support::Unsupported,
+                    touch,
                     stacking,
                     frame_pacing,
+                    presentation_feedback,
                     integer_scaling: false,
                     fractional_scaling: false,
                 },
@@ -718,6 +745,26 @@ impl X11Backend {
         )?;
         Ok(())
     }
+
+    fn relocate(&self) -> Result<bool> {
+        let Some(monitor) = monitor_geometry(&self.conn, self.root, &self.output, &mut Vec::new())?
+        else {
+            // A named output is a binding, not a preference for another monitor.
+            return Ok(false);
+        };
+        let size = anchored_size(self.anchor, self.margin, self.requested_size, monitor)?;
+        size.byte_len(self.limit)?;
+        let (x, y) = placement(self.anchor, self.margin, size, monitor)?;
+        self.conn.configure_window(
+            self.window,
+            &ConfigureWindowAux::new()
+                .x(i32::from(x))
+                .y(i32::from(y))
+                .width(size.width)
+                .height(size.height),
+        )?;
+        Ok(true)
+    }
 }
 impl OverlayBackend for X11Backend {
     fn fd(&self) -> BorrowedFd<'_> {
@@ -731,12 +778,90 @@ impl OverlayBackend for X11Backend {
         if let Some(gpu) = &self.gpu {
             gpu.check()?;
         }
-        let mut events = Vec::new();
+        let mut events = std::mem::take(&mut self.pending_input);
+        if self.ime.as_ref().is_some_and(ime::Ime::expired) {
+            self.ime_failed(
+                "XIM did not acknowledge its request within five seconds",
+                &mut events,
+            );
+        }
+        let mut topology_changed = false;
+        self.dispatch_again = true;
         for _ in 0..256 {
             let Some(event) = self.conn.poll_for_event()? else {
+                self.dispatch_again = false;
                 break;
             };
+            if let Event::Error(error) = &event {
+                if error.error_kind == x11rb::protocol::ErrorKind::Window
+                    && self.retired_ime_windows.contains(&error.bad_value)
+                {
+                    continue;
+                }
+            }
+            if let Some(touch) = &mut self.touch {
+                events.extend(touch.event(&event));
+            }
+            if let Some(keyboard) = &mut self.keyboard {
+                let input_events = keyboard.event(&self.conn, &event)?;
+                if !input_events.is_empty()
+                    && input_events
+                        .iter()
+                        .any(|e| matches!(e, OverlayEvent::InputReset { .. }))
+                {
+                    if let Some(ime) = &mut self.ime {
+                        ime.set_source(keyboard.keyboard.source);
+                        if let Err(error) = ime.reset() {
+                            self.ime_failed(error, &mut events);
+                        }
+                    }
+                }
+                events.extend(input_events);
+            }
+            if let Some(ime) = &mut self.ime {
+                match ime.filter(&event) {
+                    Ok(true) => {
+                        self.drain_ime(&mut events);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.ime_failed(error, &mut events);
+                        continue;
+                    }
+                }
+            }
+            self.drain_ime(&mut events);
+            let activity = match &event {
+                Event::ButtonPress(e) if e.event == self.window && e.response_type & 0x80 == 0 => {
+                    Some(e.time)
+                }
+                Event::KeyPress(e) if e.event == self.window && e.response_type & 0x80 == 0 => {
+                    Some(e.time)
+                }
+                _ => None,
+            };
+            if let (Some(atom), Some(time)) = (self.user_time_atom, activity) {
+                self.conn.change_property32(
+                    PropMode::REPLACE,
+                    self.window,
+                    atom,
+                    AtomEnum::CARDINAL,
+                    &[time],
+                )?;
+            }
             match event {
+                Event::ConfigureNotify(e) if e.window == self.root => {
+                    topology_changed = true;
+                }
+                Event::ShmCompletion(e) => {
+                    if let Some(upload) = &mut self.upload {
+                        upload.completed(e.shmseg);
+                    }
+                }
+                Event::RandrNotify(_) | Event::RandrScreenChangeNotify(_) => {
+                    topology_changed = true;
+                }
                 Event::Error(error) => {
                     return Err(crate::error::backend_error("X11", format!("{error:?}")))
                 }
@@ -753,6 +878,33 @@ impl OverlayBackend for X11Backend {
                     if let Some(state) = &mut self.present {
                         if state.event == e.event {
                             state.completed(e.serial, e.msc);
+                            if let Some((serial, submission, generation)) = self.pending_feedback {
+                                if serial == e.serial {
+                                    self.pending_feedback = None;
+                                    if e.mode == present::CompleteMode::SKIP {
+                                        events.push(OverlayEvent::PresentationDiscarded {
+                                            submission,
+                                            generation,
+                                        });
+                                    } else {
+                                        events.push(OverlayEvent::FramePresented(
+                                            crate::PresentationFeedback {
+                                                submission,
+                                                generation,
+                                                source: crate::PresentationSource::X11,
+                                                timestamp: Duration::from_micros(e.ust),
+                                                clock_id: None,
+                                                refresh_interval: None,
+                                                sequence: e.msc,
+                                                vsync: false,
+                                                hardware_clock: false,
+                                                hardware_completion: false,
+                                                zero_copy: false,
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -820,6 +972,19 @@ impl OverlayBackend for X11Backend {
                 Event::LeaveNotify(e) if e.event == self.window => {
                     events.push(OverlayEvent::PointerLeft)
                 }
+                Event::ButtonPress(e) if e.event == self.window && matches!(e.detail, 4..=7) => {
+                    let (axis, value) = match e.detail {
+                        4 => (crate::ScrollAxis::Vertical, -1.0),
+                        5 => (crate::ScrollAxis::Vertical, 1.0),
+                        6 => (crate::ScrollAxis::Horizontal, -1.0),
+                        _ => (crate::ScrollAxis::Horizontal, 1.0),
+                    };
+                    events.push(OverlayEvent::PointerAxis {
+                        axis,
+                        value,
+                        unit: crate::ScrollUnit::Steps,
+                    });
+                }
                 Event::ButtonPress(e)
                     if e.event == self.window && !matches!(e.detail, 0 | 4..=7) =>
                 {
@@ -836,14 +1001,44 @@ impl OverlayBackend for X11Backend {
                         state: ButtonState::Released,
                     })
                 }
-                Event::KeyPress(e) if e.event == self.window => events.push(OverlayEvent::Key {
-                    code: u32::from(e.detail.saturating_sub(8)),
-                    state: ButtonState::Pressed,
-                }),
-                Event::KeyRelease(e) if e.event == self.window => events.push(OverlayEvent::Key {
-                    code: u32::from(e.detail.saturating_sub(8)),
-                    state: ButtonState::Released,
-                }),
+                Event::KeyPress(e) if e.event == self.window => {
+                    self.handle_key(e, ButtonState::Pressed, &mut events);
+                }
+                Event::KeyRelease(e) if e.event == self.window => {
+                    self.handle_key(e, ButtonState::Released, &mut events);
+                }
+                Event::FocusIn(e)
+                    if e.event == self.window
+                        && e.mode != NotifyMode::GRAB
+                        && e.mode != NotifyMode::UNGRAB
+                        && e.detail != NotifyDetail::INFERIOR =>
+                {
+                    if let Some(keyboard) = &mut self.keyboard {
+                        events.extend(keyboard.keyboard.focus(true));
+                    }
+                    if let Some(ime) = &mut self.ime {
+                        if let Err(error) = ime.focus(true) {
+                            self.ime_failed(error, &mut events);
+                        }
+                    }
+                    self.drain_ime(&mut events);
+                }
+                Event::FocusOut(e)
+                    if e.event == self.window
+                        && e.mode != NotifyMode::GRAB
+                        && e.mode != NotifyMode::UNGRAB
+                        && e.detail != NotifyDetail::INFERIOR =>
+                {
+                    if let Some(keyboard) = &mut self.keyboard {
+                        events.extend(keyboard.keyboard.focus(false));
+                    }
+                    if let Some(ime) = &mut self.ime {
+                        if let Err(error) = ime.focus(false) {
+                            self.ime_failed(error, &mut events);
+                        }
+                    }
+                    self.drain_ime(&mut events);
+                }
                 Event::DestroyNotify(e) if e.window == self.window => {
                     events.push(OverlayEvent::Closed)
                 }
@@ -858,12 +1053,22 @@ impl OverlayBackend for X11Backend {
                 _ => {}
             }
         }
+        if topology_changed {
+            if !self.relocate()? {
+                events.push(OverlayEvent::Closed);
+            }
+            // Monitor queries can move events from the socket into x11rb's queue.
+            self.dispatch_again = true;
+        }
         if self.repaint && self.present.as_ref().is_some_and(PresentState::ready) {
             self.schedule_present()?;
         }
         Ok(events)
     }
     fn present(&mut self, frame: &Frame) -> Result<bool> {
+        if self.upload.as_ref().is_some_and(shm::Upload::busy) {
+            return Ok(false);
+        }
         let blocked = self
             .present
             .as_ref()
@@ -876,48 +1081,81 @@ impl OverlayBackend for X11Backend {
             return Ok(false);
         }
         let size = frame.size;
-        let row_bytes = size.width as usize * 4;
-        let max_data = self.conn.maximum_request_bytes().saturating_sub(28);
-        let rows = max_data / row_bytes;
-        if rows == 0 {
-            return Err(OverlayError::Unsupported(
-                "X11 maximum request size for this row width",
-            ));
-        }
-        let chunk_rows = rows.min(size.height as usize);
-        let mut data = Vec::new();
-        data.try_reserve_exact(chunk_rows * row_bytes)
-            .map_err(|_| OverlayError::Allocation {
-                bytes: chunk_rows * row_bytes,
-            })?;
-        let little_endian = self.conn.setup().image_byte_order == ImageOrder::LSB_FIRST;
-        for start in (0..size.height as usize).step_by(chunk_rows) {
-            let count = chunk_rows.min(size.height as usize - start);
-            data.clear();
-            for pixel in
-                &frame.pixels[start * size.width as usize..(start + count) * size.width as usize]
-            {
-                data.extend_from_slice(&if little_endian {
-                    pixel.to_le_bytes()
-                } else {
-                    pixel.to_be_bytes()
-                });
+        if self
+            .upload
+            .as_ref()
+            .is_some_and(|upload| upload.size() != size)
+        {
+            if let Some(upload) = self.upload.take() {
+                upload.detach(&self.conn)?;
             }
-            self.conn.put_image(
-                ImageFormat::Z_PIXMAP,
-                self.pixmap,
-                self.gc,
-                size.width as u16,
-                count as u16,
-                0,
-                start as i16,
-                0,
-                self.depth,
-                &data,
-            )?;
+            self.upload = Some(shm::Upload::create(&self.conn, size, self.limit)?);
+            self.dispatch_again = true;
+        }
+        if let Some(rectangle) = self.damage.update(frame)? {
+            if let Some(upload) = &mut self.upload {
+                upload.put(
+                    &self.conn,
+                    self.pixmap,
+                    self.gc,
+                    self.depth,
+                    frame,
+                    rectangle,
+                )?;
+            } else {
+                let row_bytes = rectangle.width as usize * 4;
+                let max_data = self.conn.maximum_request_bytes().saturating_sub(28);
+                let rows = max_data / row_bytes;
+                if rows == 0 {
+                    return Err(OverlayError::Unsupported(
+                        "X11 maximum request size for this row width",
+                    ));
+                }
+                let chunk_rows = rows.min(rectangle.height as usize);
+                let mut data = Vec::new();
+                data.try_reserve_exact(chunk_rows * row_bytes)
+                    .map_err(|_| OverlayError::Allocation {
+                        bytes: chunk_rows * row_bytes,
+                    })?;
+                let little = self.conn.setup().image_byte_order == ImageOrder::LSB_FIRST;
+                for start in (0..rectangle.height as usize).step_by(chunk_rows) {
+                    let count = chunk_rows.min(rectangle.height as usize - start);
+                    data.clear();
+                    for y in rectangle.y as usize + start..rectangle.y as usize + start + count {
+                        let first = y * size.width as usize + rectangle.x as usize;
+                        for pixel in &frame.pixels[first..first + rectangle.width as usize] {
+                            data.extend_from_slice(&if little {
+                                pixel.to_le_bytes()
+                            } else {
+                                pixel.to_be_bytes()
+                            });
+                        }
+                    }
+                    self.conn.put_image(
+                        ImageFormat::Z_PIXMAP,
+                        self.pixmap,
+                        self.gc,
+                        rectangle.width as u16,
+                        count as u16,
+                        rectangle.x as i16,
+                        (rectangle.y as usize + start) as i16,
+                        0,
+                        self.depth,
+                        &data,
+                    )?;
+                }
+            }
         }
         if self.present.is_some() {
             self.schedule_present()?;
+            if self.feedback_enabled {
+                self.next_submission = self.next_submission.wrapping_add(1);
+                self.pending_feedback = Some((
+                    self.present.as_ref().expect("Present negotiated").serial,
+                    self.next_submission,
+                    frame.generation,
+                ));
+            }
         } else {
             self.copy_to_window()?;
         }
@@ -925,44 +1163,76 @@ impl OverlayBackend for X11Backend {
         Ok(true)
     }
     fn set_click_through(&mut self, enabled: bool) -> Result<()> {
-        if !self.shape {
-            return if enabled {
-                Err(OverlayError::Unsupported("SHAPE 1.1 input regions"))
-            } else {
-                Ok(())
-            };
-        }
-        if enabled {
-            self.conn
-                .shape_rectangles(
-                    shape::SO::SET,
-                    shape::SK::INPUT,
-                    ClipOrdering::UNSORTED,
-                    self.window,
-                    0,
-                    0,
-                    &[],
-                )?
-                .check()?;
+        self.apply_region(if enabled {
+            &crate::InputRegion::Empty
         } else {
-            self.conn
-                .shape_mask(
-                    shape::SO::SET,
-                    shape::SK::INPUT,
-                    self.window,
-                    0,
-                    0,
-                    x11rb::NONE,
-                )?
-                .check()?;
+            &self.input_region
+        })
+    }
+    fn reset_input(&mut self) -> Result<()> {
+        if let Some(touch) = &mut self.touch {
+            self.pending_input.extend(touch.reset());
         }
+        if let Some(keyboard) = &mut self.keyboard {
+            keyboard.keyboard.reset();
+        }
+        if let Some(ime) = &mut self.ime {
+            if let Err(error) = ime.reset() {
+                let mut events = Vec::new();
+                self.ime_failed(error, &mut events);
+                self.pending_input.extend(events);
+            }
+        }
+        Ok(())
+    }
+    fn set_text_input(&mut self, text: crate::TextInputState) -> Result<()> {
+        text.validate()?;
+        let keyboard = self
+            .keyboard
+            .as_mut()
+            .ok_or(OverlayError::Unsupported("XKB text translation"))?;
+        if !text.enabled || text.change_cause == crate::TextChangeCause::Other {
+            keyboard.keyboard.reset_compose();
+            self.pending_input.push(OverlayEvent::TextPreedit {
+                source: keyboard.keyboard.source,
+                text: String::new(),
+                cursor: None,
+            });
+        }
+        self.text_input = text.clone();
+        if let Some(ime) = &mut self.ime {
+            if let Err(error) = ime.configure(text) {
+                let mut events = Vec::new();
+                self.ime_failed(error, &mut events);
+                self.pending_input.extend(events);
+            }
+        }
+        Ok(())
+    }
+    fn set_input_region(&mut self, region: crate::InputRegion) -> Result<()> {
+        region.validate()?;
+        self.apply_region(&region)?;
+        self.input_region = region;
         Ok(())
     }
     fn flush(&mut self) -> Result<()> {
         self.conn.flush()?;
         Ok(())
     }
+    fn needs_dispatch(&self) -> bool {
+        self.dispatch_again
+    }
+    fn idle_wait(&self) -> Option<Duration> {
+        self.uses_gpu()
+            .then_some(Duration::from_millis(250))
+            .into_iter()
+            .chain(self.ime.as_ref().and_then(ime::Ime::wait))
+            .min()
+    }
     fn frame_wait(&self) -> Option<Duration> {
+        if self.upload.as_ref().is_some_and(shm::Upload::busy) {
+            return None;
+        }
         if self.uses_gpu() {
             return Some(Duration::from_millis(2));
         }
@@ -996,10 +1266,162 @@ impl OverlayBackend for X11Backend {
         Ok(true)
     }
 }
+impl X11Backend {
+    fn ime_failed(&mut self, error: impl std::fmt::Display, events: &mut Vec<OverlayEvent>) {
+        if let Some(ime) = self.ime.take() {
+            self.retired_ime_windows.extend(ime.windows());
+        }
+        if let Some(keyboard) = &mut self.keyboard {
+            keyboard.keyboard.reset_compose();
+            let source = keyboard.keyboard.source;
+            events.push(OverlayEvent::TextPreedit {
+                source,
+                text: String::new(),
+                cursor: None,
+            });
+            events.push(OverlayEvent::InputMethod {
+                source,
+                active: false,
+            });
+            events.push(OverlayEvent::InputMethodError {
+                source,
+                message: format!("{error}").chars().take(2048).collect(),
+            });
+            events.push(OverlayEvent::InputReset {
+                source: Some(source),
+                scope: crate::InputResetScope::Keyboard,
+                reason: crate::InputResetReason::Cancelled,
+            });
+        }
+    }
+    fn drain_ime(&mut self, events: &mut Vec<OverlayEvent>) {
+        let Some(ime) = &mut self.ime else {
+            return;
+        };
+        let ime_events = ime.events();
+        if ime_events
+            .iter()
+            .any(|e| matches!(e, OverlayEvent::InputMethod { .. }))
+        {
+            if let Some(keyboard) = &mut self.keyboard {
+                keyboard.keyboard.reset_compose();
+            }
+        }
+        events.extend(ime_events);
+        for translated in ime.unhandled.drain(..) {
+            if let Some(keyboard) = &mut self.keyboard {
+                if keyboard.keyboard.focused {
+                    let composed = if self.text_input.enabled {
+                        keyboard.keyboard.compose_input(&translated)
+                    } else {
+                        Vec::new()
+                    };
+                    events.push(OverlayEvent::KeyboardInput(translated));
+                    events.extend(composed);
+                }
+            }
+        }
+    }
+    fn handle_key(
+        &mut self,
+        event: KeyPressEvent,
+        state: ButtonState,
+        events: &mut Vec<OverlayEvent>,
+    ) {
+        let Some(keyboard) = &mut self.keyboard else {
+            events.push(OverlayEvent::Key {
+                code: u32::from(event.detail.saturating_sub(8)),
+                state,
+            });
+            return;
+        };
+        keyboard.core_modifiers(u16::from(event.state));
+        let mut key_events = keyboard.keyboard.key(
+            u32::from(event.detail.saturating_sub(8)),
+            state,
+            false,
+            self.text_input.enabled,
+            false,
+        );
+        let translated = key_events.iter().find_map(|e| {
+            if let OverlayEvent::KeyboardInput(input) = e {
+                Some(input.clone())
+            } else {
+                None
+            }
+        });
+        let mut forwarded = false;
+        if let Some(ime) = &mut self.ime {
+            match ime.forward(event, translated.clone()) {
+                Ok(result) => forwarded = result,
+                Err(error) => self.ime_failed(error, events),
+            }
+        }
+        if forwarded {
+            key_events.retain(|e| !matches!(e, OverlayEvent::KeyboardInput(_)));
+        }
+        events.extend(key_events);
+        if !forwarded && self.text_input.enabled {
+            if let (Some(keyboard), Some(translated)) = (&mut self.keyboard, translated) {
+                events.extend(keyboard.keyboard.compose_input(&translated));
+            }
+        }
+    }
+    fn apply_region(&self, region: &crate::InputRegion) -> Result<()> {
+        if !self.shape {
+            return if !matches!(region, crate::InputRegion::Full) {
+                Err(OverlayError::Unsupported("SHAPE 1.1 input regions"))
+            } else {
+                Ok(())
+            };
+        }
+        if !matches!(region, crate::InputRegion::Full) {
+            let rectangles: Vec<_> = match region {
+                crate::InputRegion::Rectangles(rects) => rects
+                    .iter()
+                    .map(|r| Rectangle {
+                        x: r.x,
+                        y: r.y,
+                        width: r.width,
+                        height: r.height,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            self.conn
+                .shape_rectangles(
+                    shape::SO::SET,
+                    shape::SK::INPUT,
+                    ClipOrdering::UNSORTED,
+                    self.window,
+                    0,
+                    0,
+                    &rectangles,
+                )?
+                .check()?;
+        } else {
+            self.conn
+                .shape_mask(
+                    shape::SO::SET,
+                    shape::SK::INPUT,
+                    self.window,
+                    0,
+                    0,
+                    x11rb::NONE,
+                )?
+                .check()?;
+        }
+        Ok(())
+    }
+}
 impl Drop for X11Backend {
     fn drop(&mut self) {
         #[cfg(feature = "gpu")]
         drop(self.gpu.take());
+        drop(self.ime.take());
+        if let Some(upload) = self.upload.take() {
+            let _ = upload.detach(&self.conn);
+        }
         let _ = self.conn.destroy_window(self.window);
         if self.pixmap != x11rb::NONE {
             let _ = self.conn.free_pixmap(self.pixmap);
@@ -1021,135 +1443,5 @@ fn button_code(detail: u8) -> u32 {
         3 => 273,
         8..=u8::MAX => 275 + u32::from(detail - 8),
         _ => u32::from(detail),
-    }
-}
-fn monitor_geometry(
-    conn: &XConnection,
-    root: Window,
-    width: u16,
-    height: u16,
-    selector: &OutputSelector,
-    warnings: &mut Vec<String>,
-) -> Result<(i32, i32, u32, u32)> {
-    if conn
-        .extension_information(randr::X11_EXTENSION_NAME)?
-        .is_some()
-    {
-        let version = conn.randr_query_version(1, 5)?.reply()?;
-        if (version.major_version, version.minor_version) >= (1, 5) {
-            let monitors = conn.randr_get_monitors(root, true)?.reply()?.monitors;
-            for monitor in &monitors {
-                let chosen = match selector {
-                    OutputSelector::Automatic => {
-                        monitor.primary
-                            || (!monitors.iter().any(|m| m.primary)
-                                && monitors.first().is_some_and(|m| m.name == monitor.name))
-                    }
-                    OutputSelector::Name(name) => {
-                        conn.get_atom_name(monitor.name)?.reply()?.name == name.as_bytes()
-                    }
-                };
-                if chosen {
-                    return Ok((
-                        i32::from(monitor.x),
-                        i32::from(monitor.y),
-                        u32::from(monitor.width),
-                        u32::from(monitor.height),
-                    ));
-                }
-            }
-        }
-    }
-    if matches!(selector, OutputSelector::Name(_)) {
-        return Err(OverlayError::Unsupported("requested X11 monitor name"));
-    }
-    warnings.push("No RandR monitor geometry; placement uses the complete X11 screen.".into());
-    Ok((0, 0, u32::from(width), u32::from(height)))
-}
-fn placement(
-    anchor: Anchor,
-    margin: u32,
-    size: Size,
-    monitor: (i32, i32, u32, u32),
-) -> Result<(i16, i16)> {
-    let (x, y, w, h) = monitor;
-    let dx = i64::from(w) - i64::from(size.width);
-    let dy = i64::from(h) - i64::from(size.height);
-    let margin = i64::from(margin);
-    let px = match anchor {
-        Anchor::TopLeft | Anchor::Left | Anchor::BottomLeft => margin,
-        Anchor::TopRight | Anchor::Right | Anchor::BottomRight => dx - margin,
-        Anchor::Fill => margin,
-        _ => dx / 2,
-    };
-    let py = match anchor {
-        Anchor::TopLeft | Anchor::Top | Anchor::TopRight => margin,
-        Anchor::BottomLeft | Anchor::Bottom | Anchor::BottomRight => dy - margin,
-        Anchor::Fill => margin,
-        _ => dy / 2,
-    };
-    Ok((
-        (i64::from(x) + px)
-            .try_into()
-            .map_err(|_| OverlayError::Unsupported("X11 horizontal coordinate range"))?,
-        (i64::from(y) + py)
-            .try_into()
-            .map_err(|_| OverlayError::Unsupported("X11 vertical coordinate range"))?,
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn present_waits_for_both_notifications_and_ignores_obsolete_serials() {
-        for idle_first in [true, false] {
-            let mut state = PresentState::new(42);
-            state.submitted();
-            if idle_first {
-                state.released(1);
-            } else {
-                state.completed(1, 100);
-            }
-            assert!(!state.ready());
-            state.released(0);
-            state.completed(0, 50);
-            assert!(!state.ready());
-            if idle_first {
-                state.completed(1, 100);
-            } else {
-                state.released(1);
-            }
-            assert!(state.ready());
-            assert_eq!(state.msc, 100);
-            state.submitted();
-            state.completed(1, 100);
-            state.released(1);
-            assert!(!state.ready());
-        }
-    }
-    #[test]
-    fn anchors_respect_negative_monitor_origins_and_margins() {
-        assert_eq!(
-            placement(
-                Anchor::Center,
-                0,
-                Size::new(800, 600),
-                (-1920, 0, 1920, 1080)
-            )
-            .unwrap(),
-            (-1360, 240)
-        );
-        assert_eq!(
-            placement(
-                Anchor::BottomRight,
-                10,
-                Size::new(800, 600),
-                (0, 0, 1920, 1080)
-            )
-            .unwrap(),
-            (1110, 470)
-        );
-        assert!(placement(Anchor::Right, 0, Size::new(1, 1), (32767, 0, 100, 100)).is_err());
     }
 }

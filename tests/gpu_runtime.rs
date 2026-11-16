@@ -6,6 +6,127 @@ use liboverlay::{
 };
 use std::time::{Duration, Instant};
 
+fn wait_for_terminal(overlay: &liboverlay::OverlayWindow) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while overlay.is_running() {
+        assert!(
+            Instant::now() < deadline,
+            "runtime did not close after callback failure"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+#[ignore = "returns an error from a callback on an owned Wayland Vulkan overlay"]
+fn callback_error_is_reported_without_leaking_the_acquired_image(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let overlay = OverlayBuilder::new()
+        .with_backend(BackendPreference::WaylandOnly)
+        .with_renderer(RendererPreference::GpuRequired)
+        .with_size(64, 32)
+        .build()?;
+    overlay.draw_gpu(|_| Err(OverlayError::Gpu("intentional callback error".into())))?;
+    wait_for_terminal(&overlay);
+    assert!(
+        matches!(overlay.poll_events(), Err(OverlayError::Gpu(message)) if message == "intentional callback error")
+    );
+    overlay.close()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "destroys the device during a callback on an owned Wayland Vulkan overlay"]
+fn device_destroyed_inside_a_callback_is_terminal() -> Result<(), Box<dyn std::error::Error>> {
+    let overlay = OverlayBuilder::new()
+        .with_backend(BackendPreference::WaylandOnly)
+        .with_renderer(RendererPreference::GpuRequired)
+        .with_size(64, 32)
+        .build()?;
+    overlay.draw_gpu(|frame| {
+        frame.context.device.destroy();
+        Ok(())
+    })?;
+    wait_for_terminal(&overlay);
+    assert!(matches!(
+        overlay.poll_events(),
+        Err(OverlayError::Gpu(_) | OverlayError::RuntimePanic)
+    ));
+    overlay.close()?;
+    let recovered = OverlayBuilder::new()
+        .with_backend(BackendPreference::WaylandOnly)
+        .with_renderer(RendererPreference::GpuRequired)
+        .with_size(64, 32)
+        .build()?;
+    recovered.draw_gpu(|_| Ok(()))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if recovered
+            .poll_events()?
+            .iter()
+            .any(|event| matches!(event, liboverlay::OverlayEvent::FrameSubmitted { .. }))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "new surface did not recover after device destruction"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    recovered.close()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "destroys the device of an owned Wayland Vulkan overlay"]
+fn destroyed_device_closes_an_idle_runtime() -> Result<(), Box<dyn std::error::Error>> {
+    let overlay = OverlayBuilder::new()
+        .with_backend(BackendPreference::WaylandOnly)
+        .with_renderer(RendererPreference::GpuRequired)
+        .with_size(64, 32)
+        .build()?;
+    let context = overlay.gpu_context()?;
+    context.device.destroy();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while overlay.is_running() {
+        assert!(
+            Instant::now() < deadline,
+            "idle runtime did not observe device loss"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(overlay.poll_events(), Err(OverlayError::Gpu(_))));
+    overlay.close()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "panics inside a callback on an owned Wayland Vulkan overlay"]
+fn callback_panic_is_reported_and_native_resources_are_closed(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let overlay = OverlayBuilder::new()
+        .with_backend(BackendPreference::WaylandOnly)
+        .with_renderer(RendererPreference::GpuRequired)
+        .with_size(64, 32)
+        .build()?;
+    overlay.draw_gpu(|_| panic!("intentional callback failure"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while overlay.is_running() {
+        assert!(
+            Instant::now() < deadline,
+            "callback panic did not close the runtime"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(matches!(
+        overlay.poll_events(),
+        Err(OverlayError::RuntimePanic)
+    ));
+    overlay.close()?;
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires Wayland layer-shell and a hardware Vulkan adapter"]
 fn callback_commands_and_raii_native_cleanup() -> Result<(), Box<dyn std::error::Error>> {
@@ -13,6 +134,7 @@ fn callback_commands_and_raii_native_cleanup() -> Result<(), Box<dyn std::error:
     // compositor that announces e.g. 125%, without changing monitor settings.
     let overlay = OverlayBuilder::new()
         .with_title("liboverlay GPU lifecycle test")
+        .with_text_input(liboverlay::TextInputState::enabled())
         .with_backend(BackendPreference::WaylandOnly)
         .with_renderer(RendererPreference::GpuRequired)
         .with_size(102, 101)
@@ -30,14 +152,23 @@ fn callback_commands_and_raii_native_cleanup() -> Result<(), Box<dyn std::error:
     );
     let context = overlay.gpu_context()?;
     let (tx, rx) = std::sync::mpsc::channel();
-    let handle = overlay.clone();
+    let handle = overlay.downgrade();
     overlay.draw_gpu(move |frame| {
+        let handle = handle.upgrade().ok_or(OverlayError::Closed)?;
         let input_rejected = matches!(
             handle.set_click_through(false),
             Err(OverlayError::Unsupported(_))
         );
+        let region_rejected = matches!(
+            handle.set_input_region(liboverlay::InputRegion::Full),
+            Err(OverlayError::Unsupported(_))
+        );
+        let text_rejected = matches!(
+            handle.set_text_input(liboverlay::TextInputState::enabled()),
+            Err(OverlayError::Unsupported(_))
+        );
         let close_rejected = matches!(handle.close(), Err(OverlayError::Unsupported(_)));
-        tx.send(input_rejected && close_rejected)
+        tx.send(input_rejected && region_rejected && text_rejected && close_rejected)
             .map_err(|error| OverlayError::Gpu(error.to_string()))?;
         let _pass = frame
             .encoder
@@ -67,8 +198,12 @@ fn callback_commands_and_raii_native_cleanup() -> Result<(), Box<dyn std::error:
         "synchronous callback commands were not rejected"
     );
     assert!(overlay.is_running());
-    overlay.set_click_through(false)?;
+    overlay.set_input_region(liboverlay::InputRegion::Rectangles(vec![
+        liboverlay::InputRectangle::new(1, 1, 20, 20),
+    ]))?;
     overlay.set_click_through(true)?;
+    overlay.set_click_through(false)?;
+    overlay.set_text_input(liboverlay::TextInputState::default())?;
     println!("info={info:?}; synchronous callback commands rejected");
     // No explicit close: the final handle must wait for native thread cleanup.
     // Resources belonging to this device may outlive the window safely.

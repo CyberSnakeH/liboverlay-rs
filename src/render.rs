@@ -6,7 +6,9 @@ use std::ops::{Deref, DerefMut};
 pub struct ScaleFactor(u32);
 
 impl ScaleFactor {
+    /// Unit scale: 120/120, or 100%.
     pub const ONE: Self = Self(120);
+    /// Creates an exact positive scale with a denominator of 120.
     pub fn from_120ths(numerator: u32) -> Result<Self> {
         if numerator == 0 {
             return Err(OverlayError::InvalidConfiguration(
@@ -15,6 +17,7 @@ impl ScaleFactor {
         }
         Ok(Self(numerator))
     }
+    /// Creates an integer scale, rejecting zero and multiplication overflow.
     pub fn from_integer(scale: u32) -> Result<Self> {
         Self::from_120ths(
             scale.checked_mul(120).ok_or_else(|| {
@@ -22,12 +25,15 @@ impl ScaleFactor {
             })?,
         )
     }
+    /// Returns the exact positive numerator, for example 150 for 125%.
     pub const fn numerator(self) -> u32 {
         self.0
     }
+    /// Returns the usual floating-point multiplier.
     pub fn as_f64(self) -> f64 {
         f64::from(self.0) / 120.0
     }
+    /// Returns an integer multiplier when no fractional component exists.
     pub fn as_integer(self) -> Option<u32> {
         if self.0 % 120 == 0 {
             Some(self.0 / 120)
@@ -57,12 +63,16 @@ impl std::fmt::Debug for ScaleFactor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Two-dimensional pixel or logical extent, depending on the containing API.
 pub struct Size {
+    /// Horizontal extent.
     pub width: u32,
+    /// Vertical extent.
     pub height: u32,
 }
 
 impl Size {
+    /// Constructs an extent. APIs that allocate or submit it validate the bounds.
     pub const fn new(width: u32, height: u32) -> Self {
         Self { width, height }
     }
@@ -85,7 +95,9 @@ impl Size {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Numeric CPU pixel layout.
 pub enum PixelFormat {
+    /// `0xAARRGGBB`, with RGB channels already multiplied by alpha.
     Argb8888Premultiplied,
 }
 
@@ -123,12 +135,15 @@ impl Frame {
             owner,
         })
     }
+    /// Returns the physical extent of this frame.
     pub fn size(&self) -> Size {
         self.size
     }
+    /// Returns the premultiplied numeric ARGB format.
     pub fn format(&self) -> PixelFormat {
         PixelFormat::Argb8888Premultiplied
     }
+    /// Returns row-major pixels. Every color channel must remain at most alpha.
     pub fn pixels_mut(&mut self) -> &mut [u32] {
         &mut self.pixels
     }

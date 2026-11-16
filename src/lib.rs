@@ -12,10 +12,16 @@ compile_error!("liboverlay-rs currently supports Linux only");
 mod backend;
 mod builder;
 mod capabilities;
+#[cfg(any(feature = "wayland", feature = "x11"))]
+mod damage;
+#[cfg(feature = "egui")]
+pub mod egui;
 mod error;
 mod events;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+mod input;
+mod presentation;
 mod render;
 mod runtime;
 
@@ -28,6 +34,17 @@ pub use capabilities::{
     RendererType, StackingSupport, Support,
 };
 pub use error::{OverlayError, Result};
-pub use events::{ButtonState, OverlayEvent, WindowInfo};
+pub use events::{ButtonState, OverlayEvent, ScrollAxis, ScrollUnit, WindowInfo};
+pub use input::touch::MAX_TOUCH_CONTACTS;
+pub use input::MAX_PRESSED_KEYS;
+pub use input::{
+    InputId, InputRectangle, InputRegion, InputResetReason, InputResetScope, TouchPhase,
+    MAX_INPUT_RECTANGLES,
+};
+pub use input::{
+    KeyboardInput, KeyboardModifiers, SurroundingText, TextChangeCause, TextInputPurpose,
+    TextInputState,
+};
+pub use presentation::{PresentationFeedback, PresentationSource};
 pub use render::{premultiply, Frame, PixelFormat, ScaleFactor, Size};
-pub use runtime::OverlayWindow;
+pub use runtime::{OverlayWindow, WeakOverlayWindow};
