@@ -13,6 +13,7 @@ from check_wayland import ipc
 from check_wayland import server as wayland_server
 from check_x11 import server as x11_server
 from x11_test_input import click as x11_click
+from x11_test_input import wait_for_selection
 from vulkan_fixture import lavapipe_icd
 
 
@@ -104,9 +105,10 @@ def main():
                 stderr=subprocess.STDOUT,
             )
             cleanup.callback(stop, compositor)
-            time.sleep(0.4)
-            if compositor.poll() is not None:
-                raise RuntimeError("private picom failed")
+            try:
+                wait_for_selection(env, "_NET_WM_CM_S0", compositor)
+            except RuntimeError as error:
+                raise RuntimeError(f"{error}: {(output / 'picom.log').read_text()}") from error
             exercise(build, output, env, lambda x, y: x11_click(env, x, y), "x11")
     if args.backend in ("wayland", "both"):
         subprocess.run(

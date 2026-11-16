@@ -1,6 +1,7 @@
 """Pointer input restricted to an owned private X11 test display."""
 
 import ctypes
+import time
 
 
 def selection_owner(environment, name):
@@ -23,6 +24,21 @@ def selection_owner(environment, name):
         return xlib.XGetSelectionOwner(display, atom) if atom else 0
     finally:
         xlib.XCloseDisplay(display)
+
+
+def wait_for_selection(environment, name, process, timeout=10):
+    """Wait for a live private server to acquire its advertised X11 endpoint."""
+    deadline = time.monotonic() + timeout
+    while True:
+        code = process.poll()
+        if code is not None:
+            raise RuntimeError(f"private server exited before owning {name} (exit={code})")
+        owner = selection_owner(environment, name)
+        if owner:
+            return owner
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"private server did not acquire {name} within {timeout}s")
+        time.sleep(0.02)
 
 
 def click(environment, x, y):

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from check_wayland import ipc, server
 from vulkan_fixture import lavapipe_icd
+from x11_test_input import wait_for_selection
 
 
 def stop(child):
@@ -192,9 +193,11 @@ def main():
                     stderr=subprocess.STDOUT,
                 )
                 cleanup.callback(stop, compositor)
-                time.sleep(0.5)
-                if compositor.poll() is not None:
-                    raise RuntimeError("private picom did not start")
+                try:
+                    wait_for_selection(env, "_NET_WM_CM_S0", compositor)
+                except RuntimeError as error:
+                    detail = (args.output_dir / "picom.log").read_text()
+                    raise RuntimeError(f"{error}: {detail}") from error
                 result = subprocess.run(
                     [
                         str(binary),
