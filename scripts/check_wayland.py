@@ -17,6 +17,7 @@ from unix_transport import read_exact
 from wayland_proxy import mask_globals
 from wayland_input import TouchProbe
 from cargo_fixture import build_test
+from vulkan_fixture import lavapipe_icd
 
 
 def ipc(path, command):
@@ -264,14 +265,7 @@ def main():
     if args.gpu:
         with server() as (_, environment, gpu_control):
             drivers = [("missing", "/nonexistent/liboverlay-vulkan-driver.json")]
-            software = os.environ.get("LAVAPIPE_ICD")
-            if not software:
-                candidates = list(Path("/usr/share/vulkan/icd.d").glob("lvp_icd*.json"))
-                software = str(candidates[0]) if candidates else None
-            if software:
-                drivers.append(("software", software))
-            else:
-                raise RuntimeError("--gpu needs a lavapipe ICD; set LAVAPIPE_ICD")
+            drivers.append(("software", str(lavapipe_icd())))
             for mode, driver in drivers:
                 selected = {
                     **environment,

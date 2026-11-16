@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 from check_wayland import ipc, server
+from vulkan_fixture import lavapipe_icd
 
 
 def stop(child):
@@ -180,13 +181,7 @@ def main():
         if not picom:
             parser.error("--x11 requires picom (or PICOM=path)")
         with x11_server([]) as (_, env), contextlib.ExitStack() as cleanup:
-            icd = Path(
-                os.environ.get(
-                    "LAVAPIPE_ICD", "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"
-                )
-            )
-            if not icd.is_file():
-                parser.error("--x11 requires lavapipe (or LAVAPIPE_ICD=path)")
+            icd = lavapipe_icd()
             env["VK_DRIVER_FILES"] = str(icd)
             env["VK_ICD_FILENAMES"] = str(icd)
             with (args.output_dir / "picom.log").open("w") as log:

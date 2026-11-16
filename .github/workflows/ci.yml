@@ -87,9 +87,9 @@ jobs:
       - name: Test egui and C++ on isolated displays
         env:
           LIBOVERLAY_TEST_COMPOSITOR: pixman
-          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
         run: |
+          LAVAPIPE_ICD="$(python3 scripts/vulkan_fixture.py)"
+          export LAVAPIPE_ICD VK_DRIVER_FILES="$LAVAPIPE_ICD" VK_ICD_FILENAMES="$LAVAPIPE_ICD"
           cmake -S examples/cpp -B target/cpp -DCMAKE_BUILD_TYPE=Release
           cmake --build target/cpp -j 2
           python3 scripts/check_cpp.py --x11

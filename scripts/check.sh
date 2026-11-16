@@ -3,6 +3,7 @@
 set -eu
 cargo fmt --all --check
 python3 -m py_compile scripts/*.py
+python3 -m unittest discover -s scripts -p 'test_*.py'
 cargo test --locked
 cargo test --locked --workspace --all-features --all-targets
 cargo test --locked --workspace --all-features --doc

@@ -13,6 +13,7 @@ from check_wayland import ipc
 from check_wayland import server as wayland_server
 from check_x11 import server as x11_server
 from x11_test_input import click as x11_click
+from vulkan_fixture import lavapipe_icd
 
 
 def exercise(build, output, env, click, backend):
@@ -87,9 +88,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     if args.backend in ("x11", "both"):
         with x11_server([]) as (_, env), contextlib.ExitStack() as cleanup:
-            env["VK_DRIVER_FILES"] = os.environ.get(
-                "LAVAPIPE_ICD", "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json"
-            )
+            env["VK_DRIVER_FILES"] = str(lavapipe_icd())
             env["VK_ICD_FILENAMES"] = env["VK_DRIVER_FILES"]
             log = cleanup.enter_context((output / "picom.log").open("w"))
             compositor = subprocess.Popen(
