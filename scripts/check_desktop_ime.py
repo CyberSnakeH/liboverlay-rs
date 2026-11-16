@@ -14,6 +14,7 @@ import time
 from cargo_fixture import build_test
 from check_wayland import run_fixture, server as wayland_server
 from check_x11 import server
+from x11_test_input import selection_owner
 
 
 @contextlib.contextmanager
@@ -28,10 +29,24 @@ def input_method(environment, framework, directory, backend, server_preedit):
     )
     if framework == "ibus":
         environment.update(
+            # Share isolated settings with the separately spawned Anthy engine.
+            # The memory backend is process-local, and Ubuntu defaults to Latin.
+            GSETTINGS_BACKEND="keyfile",
             IBUS_ADDRESS=f"unix:path={directory}/ibus",
             XMODIFIERS="@im=ibus",
             LIBOVERLAY_TEST_IME_KEYS="57,31,43,32,57",
             LIBOVERLAY_TEST_IME_TEXT="にほん",
+        )
+        subprocess.run(
+            [
+                "gsettings",
+                "set",
+                "org.freedesktop.ibus.engine.anthy.common",
+                "input-mode",
+                "0",  # Hiragana
+            ],
+            env=environment,
+            check=True,
         )
         command = [
             "ibus-daemon",
@@ -151,7 +166,12 @@ def input_method(environment, framework, directory, backend, server_preedit):
                     stderr=subprocess.PIPE,
                 )
                 if result.returncode == 0:
-                    break
+                    # The XIM child can publish its selection after the daemon
+                    # already answers D-Bus calls. Start the overlay only once
+                    # its actual X11 input-method endpoint exists.
+                    name = "@server=ibus" if framework == "ibus" else "@server=fcitx"
+                    if backend != "x11" or selection_owner(environment, name):
+                        break
                 if process.poll() is not None or time.monotonic() >= deadline:
                     raise RuntimeError(
                         f"{framework} did not become ready: {result.stderr.decode()}"

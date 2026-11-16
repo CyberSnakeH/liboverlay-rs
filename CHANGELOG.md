@@ -41,6 +41,9 @@
 
 ### Robustness
 
+- Private desktop-input checks wait for the XIM endpoint and select Anthy
+  Hiragana through shared temporary settings, independent of distribution defaults.
+
 - Positional Wayland keymap reads, independent of the compositor-shared file
   descriptor's cursor; avoids false XKB truncation and immediate closure of
   interactive overlays on Hyprland.

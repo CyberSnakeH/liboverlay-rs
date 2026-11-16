@@ -104,7 +104,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install desktop protocol fixtures
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb x11-xkb-utils sway ibus ibus-anthy fcitx5 fcitx5-hangul dbus-x11 libglib2.0-bin python3-gi gir1.2-gtk-4.0
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb x11-xkb-utils sway ibus ibus-anthy fcitx5 fcitx5-hangul fcitx5-module-xorg fcitx5-module-wayland dbus-x11 libglib2.0-bin python3-gi gir1.2-gtk-4.0
       - run: rustup toolchain install stable --profile minimal
       - name: Test actual desktop input methods
         run: |

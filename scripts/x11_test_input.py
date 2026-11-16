@@ -3,6 +3,28 @@
 import ctypes
 
 
+def selection_owner(environment, name):
+    """Observe readiness of an IM server on the owned X11 display."""
+    if environment.get("LIBOVERLAY_TEST_PRIVATE_X11") != "1":
+        raise RuntimeError("Selection queries are restricted to the private fixture")
+    xlib = ctypes.CDLL("libX11.so.6")
+    xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    xlib.XOpenDisplay.restype = ctypes.c_void_p
+    xlib.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    xlib.XInternAtom.restype = ctypes.c_ulong
+    xlib.XGetSelectionOwner.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    xlib.XGetSelectionOwner.restype = ctypes.c_ulong
+    xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    display = xlib.XOpenDisplay(environment["DISPLAY"].encode())
+    if not display:
+        raise RuntimeError("Cannot open private X11 display")
+    try:
+        atom = xlib.XInternAtom(display, name.encode("ascii"), 1)
+        return xlib.XGetSelectionOwner(display, atom) if atom else 0
+    finally:
+        xlib.XCloseDisplay(display)
+
+
 def click(environment, x, y):
     """Send a bounded pointer click only to the explicitly supplied private display."""
     import time
