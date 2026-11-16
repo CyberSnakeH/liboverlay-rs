@@ -1,8 +1,8 @@
 //! Virtual devices and a controlled IME, restricted to a runner-owned Sway.
 #![cfg(feature = "wayland")]
 use liboverlay::{
-    Anchor, BackendPreference, ButtonState, InputRectangle, InputRegion, OutputSelector,
-    OverlayBuilder, OverlayEvent, OverlayWindow, SurroundingText, TextChangeCause, TextInputState,
+    BackendPreference, ButtonState, InputRectangle, InputRegion, OutputSelector, OverlayBuilder,
+    OverlayEvent, OverlayWindow, SurroundingText, TextChangeCause, TextInputState,
 };
 use std::{
     collections::BTreeMap,
@@ -30,6 +30,22 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 };
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
+#[path = "fixtures/wayland_background.rs"]
+mod background;
+
+trait EventSource {
+    fn poll_events(&self) -> Result<Vec<OverlayEvent>>;
+}
+impl EventSource for OverlayWindow {
+    fn poll_events(&self) -> Result<Vec<OverlayEvent>> {
+        Ok(OverlayWindow::poll_events(self)?)
+    }
+}
+impl EventSource for background::Background {
+    fn poll_events(&self) -> Result<Vec<OverlayEvent>> {
+        background::Background::poll_events(self)
+    }
+}
 #[derive(Default)]
 struct State {
     seat: Option<wl_seat::WlSeat>,
@@ -326,8 +342,9 @@ impl Drop for Devices {
         let _ = self.conn.flush();
     }
 }
+#[track_caller]
 fn wait(
-    overlay: &OverlayWindow,
+    overlay: &impl EventSource,
     mut predicate: impl FnMut(&OverlayEvent) -> bool,
 ) -> Result<Vec<OverlayEvent>> {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -341,7 +358,11 @@ fn wait(
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    Err(format!("private Wayland input timed out: {all:?}").into())
+    Err(format!(
+        "private Wayland input at {} timed out: {all:?}",
+        std::panic::Location::caller()
+    )
+    .into())
 }
 fn signal(stage: &str) -> Result {
     println!("READY {stage}");
@@ -363,10 +384,7 @@ fn builder() -> OverlayBuilder {
 #[ignore = "injects virtual input only into the runner's private Sway"]
 fn keyboard_regions_and_input_method() -> Result {
     let mut devices = Devices::new()?;
-    let background = builder()
-        .with_anchor(Anchor::Fill)
-        .with_click_through(false)
-        .build()?;
+    let background = background::Background::new()?;
     let region = InputRegion::Rectangles(vec![InputRectangle::new(70, 30, 20, 20)]);
     let text = TextInputState {
         surrounding: Some(SurroundingText {

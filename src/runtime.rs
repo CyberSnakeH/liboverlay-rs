@@ -263,13 +263,7 @@ impl OverlayWindow {
         }
         let (tx, rx) = bounded(1);
         self.send(Command::ClickThrough(enabled, tx))?;
-        rx.recv_timeout(self.inner.timeout)
-            .map_err(|error| match error {
-                crossbeam_channel::RecvTimeoutError::Timeout => {
-                    OverlayError::Timeout("setting the input region")
-                }
-                crossbeam_channel::RecvTimeoutError::Disconnected => OverlayError::Closed,
-            })?
+        self.wait_reply(rx, "setting the input region")
     }
     /// Applies a pointer/touch region and disables click-through. A later
     /// `set_click_through(true)` masks it until `set_click_through(false)`.
@@ -284,13 +278,7 @@ impl OverlayWindow {
         }
         let (tx, rx) = bounded(1);
         self.send(Command::InputRegion(region, tx))?;
-        rx.recv_timeout(self.inner.timeout)
-            .map_err(|error| match error {
-                crossbeam_channel::RecvTimeoutError::Timeout => {
-                    OverlayError::Timeout("setting the input region")
-                }
-                crossbeam_channel::RecvTimeoutError::Disconnected => OverlayError::Closed,
-            })?
+        self.wait_reply(rx, "setting the input region")
     }
     /// Captures keyboard focus for an interactive Wayland layer, or yields it.
     /// Requires `KeyboardMode::OnDemand` at startup. Enabled requests exclusive
@@ -310,13 +298,7 @@ impl OverlayWindow {
         }
         let (tx, rx) = bounded(1);
         self.send(Command::KeyboardCapture(enabled, tx))?;
-        rx.recv_timeout(self.inner.timeout)
-            .map_err(|error| match error {
-                crossbeam_channel::RecvTimeoutError::Timeout => {
-                    OverlayError::Timeout("changing keyboard capture")
-                }
-                crossbeam_channel::RecvTimeoutError::Disconnected => OverlayError::Closed,
-            })?
+        self.wait_reply(rx, "changing keyboard capture")
     }
     /// Updates or disables the focused text field. This requires on-demand
     /// keyboard interaction at startup. Surrounding text uses UTF-8 byte offsets;
@@ -335,13 +317,7 @@ impl OverlayWindow {
         }
         let (tx, rx) = bounded(1);
         self.send(Command::TextInput(state, tx))?;
-        rx.recv_timeout(self.inner.timeout)
-            .map_err(|error| match error {
-                crossbeam_channel::RecvTimeoutError::Timeout => {
-                    OverlayError::Timeout("updating text input")
-                }
-                crossbeam_channel::RecvTimeoutError::Disconnected => OverlayError::Closed,
-            })?
+        self.wait_reply(rx, "updating text input")
     }
     /// Drains the shared bounded event queue. Clones consume the same queue;
     /// events are not broadcast. A fatal error is returned once, before queued events.
@@ -369,6 +345,31 @@ impl OverlayWindow {
         // The reader may already have closed after observing the stop flag.
         let _ = wake(&self.inner.wake);
         join_worker(&self.inner.worker, self.inner.timeout)
+    }
+    fn wait_reply(&self, reply: Receiver<Result<()>>, operation: &'static str) -> Result<()> {
+        let deadline = Instant::now() + self.inner.timeout;
+        loop {
+            // Closure is authoritative even if a blocked backend still owns a
+            // queued reply sender. Do not report a command timeout after close.
+            if !self.is_running() {
+                // A backend error acknowledged before shutdown remains useful
+                // to the caller, even if this thread resumes after cleanup.
+                return reply.try_recv().unwrap_or(Err(OverlayError::Closed));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return reply
+                    .try_recv()
+                    .unwrap_or(Err(OverlayError::Timeout(operation)));
+            }
+            match reply.recv_timeout(remaining.min(Duration::from_millis(10))) {
+                Ok(result) => return result,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    return Err(OverlayError::Closed);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            }
+        }
     }
     fn send(&self, command: Command) -> Result<()> {
         if !self.is_running() {

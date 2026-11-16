@@ -54,6 +54,8 @@
   interruption. Bounded tracking of keys and contacts.
 
 - Shutdown independent of a full drawing queue and a shared join for concurrent calls.
+- Synchronous input commands observe concurrent closure even while a native
+  operation still retains their reply; running commands keep their configured deadline.
 - GPU callback panics surfaced as `RuntimePanic`, with the acquired image discarded
   before swapchain destruction.
 - GPU device loss detection while idle and while waiting for callbacks.

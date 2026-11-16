@@ -97,7 +97,8 @@ jobs:
 
 
   desktop-input:
-    runs-on: ubuntu-24.04
+    # Noble does not package ibus-anthy; keep the actual Anthy engine covered.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
         with:

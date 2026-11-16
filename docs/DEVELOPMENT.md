@@ -54,6 +54,8 @@ RUSTUP_TOOLCHAIN=1.85.0 sh scripts/check.sh
 
 The [CI configuration](../.github/workflows/ci.yml) runs these checks and builds
 static musl CPU examples. A local run does not constitute a remote workflow run.
+The desktop input job uses Ubuntu 22.04 because Ubuntu 24.04 does not package
+IBus/Anthy; other jobs use Ubuntu 24.04.
 
 ## Contracts to preserve
 

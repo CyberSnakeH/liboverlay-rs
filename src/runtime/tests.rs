@@ -226,7 +226,10 @@ fn concurrent_drawing_input_and_closure_finish_without_deadlock() {
                             Ok(()) | Err(OverlayError::QueueFull) => {}
                             Err(OverlayError::Closed) => break,
                             Err(error) => {
-                                panic!("unexpected concurrent command error: {error}")
+                                panic!(
+                                    "unexpected concurrent command error: {error}; running={}",
+                                    window.is_running()
+                                )
                             }
                         }
                     }
@@ -236,6 +239,46 @@ fn concurrent_drawing_input_and_closure_finish_without_deadlock() {
     });
     assert!(!window.is_running());
     window.close().unwrap();
+}
+
+#[test]
+fn closing_cancels_reply_waits_even_while_the_backend_retains_the_sender() {
+    let (window, rx, _read) = mock_window();
+    std::thread::scope(|scope| {
+        let caller = window.clone();
+        let waiting = scope.spawn(move || caller.set_click_through(false));
+        // Keep the queued command and its reply sender alive, as a blocked
+        // native operation can do. Disconnect cannot release the caller.
+        let pending = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        window.close().unwrap();
+        assert!(matches!(waiting.join().unwrap(), Err(OverlayError::Closed)));
+        drop(pending);
+    });
+}
+
+#[test]
+fn an_unanswered_command_still_times_out_while_the_window_is_running() {
+    let (mut window, _rx, _read) = mock_window();
+    Arc::get_mut(&mut window.inner).unwrap().timeout = Duration::from_millis(20);
+    assert!(matches!(
+        window.set_click_through(false),
+        Err(OverlayError::Timeout("setting the input region"))
+    ));
+    assert!(window.is_running());
+}
+
+#[test]
+fn an_acknowledged_backend_error_survives_concurrent_shutdown() {
+    let (window, _rx, _read) = mock_window();
+    let (reply, response) = bounded(1);
+    reply
+        .send(Err(OverlayError::Unsupported("native input error")))
+        .unwrap();
+    window.close().unwrap();
+    assert!(matches!(
+        window.wait_reply(response, "test command"),
+        Err(OverlayError::Unsupported("native input error"))
+    ));
 }
 
 #[test]
