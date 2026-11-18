@@ -8,17 +8,46 @@ application logic. `include/liboverlay_canvas.hpp` provides `Canvas` (RAII) and
 interface in C or C++; Rust and egui remain inside the library. No
 application-specific Rust code is required.
 
-CMake integration from a neighboring checkout requires:
+### Build a C++ application from the source archive
+
+Install Rust 1.85 or newer with Cargo, CMake 3.20 or newer, a C/C++ toolchain,
+pkg-config and the Wayland development files (for example, `libwayland-dev`
+on Debian/Ubuntu). To open a canvas at runtime, the Vulkan loader, a compatible
+driver and a compositor offering surface alpha are required.
+
+Extract the full source archive as a sibling of the application's directory:
+
+```sh
+mkdir -p ../liboverlay-rs
+tar -xzf liboverlay-rs-0.2.0-source.tar.gz -C ../liboverlay-rs --strip-components=1
+```
+
+In the application's `CMakeLists.txt`:
 
 ```cmake
+cmake_minimum_required(VERSION 3.20)
+project(my_application LANGUAGES CXX)
 add_subdirectory("../liboverlay-rs" "liboverlay")
+add_executable(my_application main.cpp)
+target_compile_features(my_application PRIVATE cxx_std_17)
 target_link_libraries(my_application PRIVATE liboverlay::overlay)
 ```
 
-CMake automatically builds `liboverlay_c.so` in release mode. The Rust compiler
-remains a library build dependency; its code is not copied into the application.
-The build expects the complete checkout; it does not yet provide a system
-package or installed target.
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/my_application
+```
+
+The target exports the include directory and invokes Cargo with the supplied
+lockfile. It produces `liboverlay_c.so` in the CMake build tree and links the
+application to that copy. Keep the build tree in place when running this example.
+Distributors who relocate their executable must also arrange for the dynamic
+loader to find the locally built library. The full archive contains source only.
+The separate Rust `.crate` contains the core library and is intended for Cargo
+consumers.
+
+### Draw from C++
 
 ```cpp
 #include "liboverlay_canvas.hpp"
@@ -57,7 +86,8 @@ Commands cover rectangles, lines, circles, triangles, text, clipping, panels,
 labels, buttons, checkboxes, sliders and separators. Coordinates use surface
 logical pixels; `info()` provides current dimensions. Colors are
 non-premultiplied `0xRRGGBBAA` values. `Frame::clip` limits subsequent primitives;
-`reset_clip` restores the full surface. Panels do not inherit primitive clipping.
+the next `clip` replaces the previous rectangle and `reset_clip` restores the
+full surface. Panels do not inherit primitive clipping.
 
 Panels arrange scrollable vertical content. They have a position, width and
 maximum content height. Panels cannot be nested. Each panel and interactive

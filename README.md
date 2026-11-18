@@ -16,12 +16,13 @@ window tracking, and input management handled by the library. See the
 
 ## Installation
 
-This repository contains development version 0.2.0. To use it directly in an
-application:
+Version 0.2.0 is a release candidate distributed locally as source. For a Rust
+application, extract the prepared `.crate` or the full source archive into
+`vendor/liboverlay-rs` (remove the archive's top-level directory) and use:
 
 ```toml
 [dependencies]
-liboverlay-rs = { git = "https://github.com/CyberSnakeH/liboverlay-rs", branch = "main" }
+liboverlay = { package = "liboverlay-rs", path = "vendor/liboverlay-rs" }
 ```
 
 The imported module remains `liboverlay`. To enable Vulkan, add
@@ -29,13 +30,32 @@ The imported module remains `liboverlay`. To enable Vulkan, add
 1.85; see the [validation coverage](docs/TESTING.md) for the compilers actually
 tested.
 
-To run the examples from source:
+For C and C++17, use the full source archive. It contains the public headers,
+the Rust FFI crate and the CMake target. CMake builds the shared library locally
+with Cargo. See the [C/C++ build instructions](docs/CPP.md).
+
+To run the examples from a checkout:
 
 ```sh
 git clone https://github.com/CyberSnakeH/liboverlay-rs.git
 cd liboverlay-rs
 cargo run --example basic_hud -- auto 10
 ```
+
+## 0.2 support scope
+
+Linux x86-64 validation covers the CPU backends, Wayland layer-shell and X11
+with the documented server capabilities. Vulkan coverage includes NVIDIA
+hardware on Wayland and explicitly enabled lavapipe in isolated sessions. The
+C/C++ canvas requires a transparent Vulkan surface. Xorg CPU rendering, alpha,
+focus and fullscreen behavior have also been exercised in a QEMU guest.
+
+Physical Intel and AMD GPUs, physical Xorg sessions, monitor hotplug and
+fullscreen transitions on other desktops remain unverified. Touch input is
+outside the 0.2 support scope. Global shortcuts are implemented for Hyprland.
+The project makes no optical latency or physical frame-rate claim.
+See the [hardware matrix](docs/HARDWARE_VALIDATION.md) and
+[recorded runs](docs/TESTING.md).
 
 ## Documentation
 
@@ -122,7 +142,7 @@ backend. An explicit `WaylandOnly` or `X11Only` preference disables fallback.
 | Keyboard | XKB and repeat; OnDemand with layer-shell v4+ | XKB and repeat; managed window for OnDemand |
 | Composed text | XCompose and text-input-v3 | XCompose and XIM |
 | Custom regions | Union of logical rectangles | SHAPE INPUT 1.1 |
-| Touch | wl_touch, per seat | XInput 2.2+, per source |
+| Touch (experimental, outside 0.2 support) | wl_touch, per seat | XInput 2.2+, per source |
 | CPU frame pacing | Compositor callback | Synchronized Present, otherwise a timer |
 | GPU frame pacing | FIFO swapchain and compositor callback | FIFO swapchain, if the driver meets the requirements |
 | Scaling | Fractional with fractional-scale + viewporter, otherwise integer | X11 screen pixels |

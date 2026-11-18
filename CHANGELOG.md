@@ -41,6 +41,9 @@
 
 ### Robustness
 
+- Restore the full C/C++ drawing surface after a clip reset and allow a new
+  clip rectangle to replace the previous one.
+
 - Private desktop-input checks wait for the XIM endpoint and select Anthy
   Hiragana through shared temporary settings, independent of distribution defaults.
 

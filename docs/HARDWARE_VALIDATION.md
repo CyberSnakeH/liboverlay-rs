@@ -1,5 +1,19 @@
 # Hardware validation and optical measurement
 
+## 0.2 support and validation matrix
+
+| Configuration | Evidence and boundary |
+|---|---|
+| Linux x86-64, Wayland | Private Sway protocol tests, NVIDIA Vulkan endurance on a private Sway output, and desktop observations on Hyprland and KDE/KWin. Wayland native overlays require layer-shell. |
+| X11 on virtual displays | Xvfb covers extension availability and virtual RandR changes. Native Xorg in QEMU covers CPU rendering and input on a virtual KMS display. |
+| XWayland | Tested on NVIDIA, including CPU fallback when the Vulkan surface only advertises opaque alpha. Fullscreen stacking depends on the compositor. |
+| Vulkan | RTX 5070 Ti and historical RTX 3070 Ti Laptop results are recorded by session. Lavapipe exercises software rendering with explicit opt-in. Physical Intel and AMD GPU results remain open. |
+| Physical displays | Hardware Xorg, unplug/replug and additional desktop fullscreen or driver transitions remain unverified. Physical refresh rate and input-to-light latency require optical measurements. |
+| Input | Pointer and keyboard coverage includes isolated protocol tests and documented desktop sessions. Touch is outside the supported 0.2 feature set. Global shortcuts are Hyprland-specific. |
+
+See [TESTING.md](TESTING.md) for versions, scenarios and the revision limits of
+the endurance campaign.
+
 ## Available coverage
 
 The inventory from November 15, 2026 identifies an NVIDIA graphics controller
@@ -40,9 +54,9 @@ scenario passed with the private NVIDIA Vulkan renderer: focus, clicks, and keys
 were checked at every step. Other desktops' and applications' policies must be
 recorded in their own test sessions.
 
-## Touch panel
+## Future touch panel validation
 
-Run `cargo run --example input_events` on an equipped machine. Check multiple
+Touch remains experimental in 0.2. For a future support assessment, run `cargo run --example input_events` on an equipped machine. Check multiple
 simultaneous contacts, movement, leaving the region, termination, and
 cancellation when removing the device. Retain events and the backend report.
 Contacts from distinct sources may share an identifier; a new press may reuse

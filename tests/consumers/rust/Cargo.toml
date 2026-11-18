@@ -1,0 +1,10 @@
+[package]
+name = "overlay-consumer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+resolver = "3"
+publish = false
+
+[dependencies]
+liboverlay = { package = "liboverlay-rs", path = "../rust-package" }

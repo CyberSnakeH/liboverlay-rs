@@ -1,7 +1,8 @@
 # Input: contracts and integration
 
 Custom regions, keyboard translation, composition and touch are implemented for
-Wayland and X11. They use the same display thread as rendering. The core does
+Wayland and X11. Touch is experimental and outside the 0.2 support scope.
+These features use the same display thread as rendering. The core does
 not automatically install global shortcuts. The C/C++ API can explicitly
 register Hyprland shortcuts; see [CPP.md](CPP.md). Negotiated capabilities appear
 in `backend_report()`, a startup snapshot taken before any subsequent hardware

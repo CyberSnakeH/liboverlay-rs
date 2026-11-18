@@ -374,3 +374,58 @@ modes, rendering, checkbox/slider clicks and closing with actions returned to
 C++. Hyprland shortcut tests require that real session and remain separate from
 Sway tests. The library explicitly exposes unsupported integrations. See
 [CPP.md](CPP.md).
+
+## Source distributions and native Xorg on November 18, 2026
+
+Two external projects exercise the user-facing archives. The Rust client built
+with Cargo and rustc 1.85.0 and again with 1.99.1. Each run opened a Wayland
+surface, presented an opaque green CPU frame from the extracted crate and
+explicitly closed the window after the compositor capture confirmed its pixels.
+
+The C++17 client (GCC 16.2.1, CMake 4.3.0) uses the public CMake target and
+compiles the bridge from the full archive. The scene checks lines, filled
+circles and triangles, visible glyph strokes, replacement and reset of the clip
+rectangle, and two layers of 50% alpha over black. Red alone measured
+`(128, 0, 0)`, blue alone `(0, 0, 128)`, and blue over red `(64, 0, 128)`.
+The test checks the interior colors and the background around the geometry,
+including all four sides of the clip.
+
+| Private display | 100% | 125% |
+|---|---|---|
+| Sway, pixman compositor, lavapipe client | 640 × 480 output, scale 1 | 800 × 600 output, negotiated scale 1.25, identical logical scene |
+| Xvfb, picom XRender compositor, lavapipe client | 640 × 480, native screen pixels | 800 × 600, application multiplies coordinates, stroke widths and font size by 1.25 |
+
+Wayland captures use grim at the output scale. X11 captures read the composited
+root window. X11 canvas coordinates are screen pixels, so the 125% case checks
+application scaling. The [distribution procedure](DEVELOPMENT.md#preparing-a-release)
+reproduces these checks outside the checkout.
+
+The Xorg run used Fedora 45 userspace and kernel 7.3.3 in a separate x86-64
+QEMU guest with TCG, two virtual CPUs, 1200 MiB of RAM, standard VGA and the
+Bochs DRM driver. Xorg 21.1.26 opened the guest's `/dev/dri/card0` with the
+`modesetting` driver on a 640 × 480 virtual output. Acceleration was disabled.
+The guest ran the CPU backend without a host display or network connection.
+
+| Guest session | Tests passed | Observation |
+|---|---|---|
+| Bare Xorg | `opaque_upload_resize_and_cleanup`, `partial_updates_preserve_unchanged_pixels_and_resize` | CPU uploads, preserved pixels, resizing and cleanup |
+| Xorg with picom (XRender) | `composed_alpha_matches_premultiplied_pixels`, `alpha_input_region_focus_and_cleanup` | Composited RGB values, ARGB readback, input regions and unchanged focus; the backend selected XPresent |
+| Xorg with Openbox and picom | `keyboard_focus_and_fullscreen_policy` | Stacking, focus on click, delivery of raw keys and return of focus to the background |
+
+To repeat in a disposable guest, configure a single 640 × 480 Xorg output.
+Build the two test binaries with the following command and run the named tests
+in the table in order, each with `--exact NAME --ignored --nocapture`, with
+`DISPLAY` pointing to the guest Xorg server.
+
+```sh
+cargo test --locked --no-default-features --features x11 \
+  --test x11_headless --test x11_protocol --no-run
+```
+
+The bare-server tests belong to `x11_headless`. For `x11_protocol`, start
+`picom --config /dev/null --backend xrender` and set
+`LIBOVERLAY_TEST_PRIVATE_COMPOSITOR=1`. For the last case, use the Openbox
+configuration and startup readiness marker from `scripts/check_x11.py --wm`
+and set `LIBOVERLAY_TEST_PRIVATE_WM=1`. Input events target only the test
+windows on that guest. This run covers virtual KMS and CPU rendering. Physical
+Xorg drivers, Vulkan on Xorg hardware and monitor hotplug remain unverified.

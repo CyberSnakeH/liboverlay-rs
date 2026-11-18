@@ -205,8 +205,8 @@ pub(super) fn show(ctx: &egui::Context, commands: &[OwnedCommand], events: &mut 
                     color(c.color),
                 );
             }
-            6 => painter = painter.with_clip_rect(rect.intersect(screen)),
-            7 => painter = painter.with_clip_rect(screen),
+            6 => painter.set_clip_rect(rect.intersect(screen)),
+            7 => painter.set_clip_rect(screen),
             10 => {
                 let start = i + 1;
                 let end = start

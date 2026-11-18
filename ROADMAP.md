@@ -38,6 +38,7 @@ server coverage.
   hardware sessions, according to each desktop's policies.
 - [x] Run the same CPU musl binary on Alpine 3.22 and Debian 12, connected to a
   private compositor on the host.
+- [x] Run CPU rendering, composited alpha, focus and fullscreen tests on native Xorg in a QEMU guest.
 - [ ] Complete testing on a hardware Xorg session and physical Intel/AMD GPUs.
 - [ ] Check physical monitor hotplug and driver transitions not reproduced by
   virtual outputs.
@@ -72,7 +73,7 @@ server coverage.
 - [x] Implement custom regions and touch, with isolated protocol validation.
 - [x] Test IBus/Anthy through XIM and Fcitx5/Hangul through XIM and text-input-v3,
   including intermediate commits and preedit styles.
-- [ ] Complete physical touch panel testing; no panel is available here.
+- [ ] Assess physical touch panels for a future version. Touch is outside 0.2 support.
 - [x] Add a text HUD example with fontdue, an application-supplied font, and scaling.
 
 ## Release preparation
@@ -80,7 +81,10 @@ server coverage.
 - [x] Document public contracts, breaking changes, and validation limits.
 - [x] Add a changelog and a release preparation procedure.
 - [x] Verify final package contents, compilation, and documentation links.
-- [ ] Create the tag and publish the release after validating the distributed revision.
+- [x] Define the Linux support scope and the boundaries of the hardware results.
+- [x] Exercise an external Rust application with the unpacked Cargo package and
+  a C++17 application with the full source archive and its public CMake target.
+- [ ] Tagging or publication is a separate maintainer decision.
 
 Compatibility remains determined by capabilities negotiated with the graphics
 server and driver. Display above every fullscreen application or above a lock

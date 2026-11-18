@@ -80,7 +80,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install headless compositor and software Vulkan
-        run: sudo apt-get update && sudo apt-get install -y sway libwayland-dev pkg-config mesa-vulkan-drivers cmake g++ grim xvfb picom libxtst6
+        run: sudo apt-get update && sudo apt-get install -y sway libwayland-dev pkg-config mesa-vulkan-drivers cmake g++ grim xvfb picom libxtst6 python3-pil
       - run: rustup toolchain install stable --profile minimal
       - name: Test isolated Wayland sessions and Vulkan policies
         run: python3 scripts/check_wayland.py --gpu
@@ -95,6 +95,18 @@ jobs:
           python3 scripts/check_cpp.py --x11
           python3 scripts/check_canvas.py
 
+      - name: Build downstream clients from source distributions
+        run: |
+          git archive --format=tar.gz --prefix=liboverlay-rs/ -o "$RUNNER_TEMP/overlay-source.tar.gz" HEAD
+          cargo package --locked -p liboverlay-rs --all-features --no-verify
+          /usr/bin/python3 scripts/check_source_install.py "$RUNNER_TEMP/overlay-source.tar.gz" target/package/liboverlay-rs-*.crate --draw
+
+      - name: Render from the packaged crate with Rust 1.85
+        env:
+          RUSTUP_TOOLCHAIN: 1.85.0
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal
+          /usr/bin/python3 scripts/check_source_install.py "$RUNNER_TEMP/overlay-source.tar.gz" target/package/liboverlay-rs-*.crate --draw --rust-only
 
   desktop-input:
     # Noble does not package ibus-anthy; keep the actual Anthy engine covered.

@@ -89,8 +89,30 @@ the manifest's lints.
    cargo package --locked --allow-dirty --list
    ```
 
-4. Repeat validation on the revision intended for distribution, then create the
-   corresponding tag and publish using the project owner's account.
+4. From a clean checkout of the intended revision, build the full source archive
+   and run two downstream applications against the actual archives. Both projects
+   are copied to a temporary directory outside the checkout. The Rust client
+   resolves the extracted crate as a path dependency. The C++17 client builds
+   the bridge from the full archive with the public CMake target.
+
+   ```sh
+   mkdir -p target/distribution
+   git archive --format=tar.gz --prefix=liboverlay-rs-0.2.0/ \
+     -o target/distribution/liboverlay-rs-0.2.0-source.tar.gz HEAD
+   cp target/package/liboverlay-rs-0.2.0.crate target/distribution/
+   python3 scripts/check_source_install.py \
+     target/distribution/liboverlay-rs-0.2.0-source.tar.gz \
+     target/distribution/liboverlay-rs-0.2.0.crate --draw
+   ```
+
+   The default checks need no display. `--draw` reads back the Rust CPU frame on
+   private Sway and C++ primitives on both Sway and Xvfb/picom at two scales.
+   Install grim, lavapipe and Pillow with XCB support for captures. Add
+   `--rust-only` and select Rust 1.85.0 to repeat the packaged Rust client
+   check with the minimum compiler.
+   The build requires Cargo dependencies in the local cache or registry access
+   to download them.
+   Set `CARGO_NET_OFFLINE=true` to use a populated cache.
 
 A verified package build creates neither a tag nor a crates.io publication.
 Validation requiring other GPUs or a hardware Xorg session remains identified
